@@ -441,7 +441,7 @@ impl File {
     }
 
     pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
-        crate::io::default_read_buf(|buf| self.read(buf), cursor)
+        self.fd.read_buf(cursor)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -498,6 +498,7 @@ impl File {
 }
 
 impl AsInner<WasiFd> for File {
+    #[inline]
     fn as_inner(&self) -> &WasiFd {
         &self.fd
     }
@@ -522,6 +523,7 @@ impl AsFd for File {
 }
 
 impl AsRawFd for File {
+    #[inline]
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }

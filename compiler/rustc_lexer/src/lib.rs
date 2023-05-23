@@ -2,7 +2,7 @@
 //!
 //! The idea with `rustc_lexer` is to make a reusable library,
 //! by separating out pure lexing and rustc-specific concerns, like spans,
-//! error reporting, and interning.  So, rustc_lexer operates directly on `&str`,
+//! error reporting, and interning. So, rustc_lexer operates directly on `&str`,
 //! produces simple tokens which are a pair of type-tag and a bit of original text,
 //! and does not report errors, instead storing them as flags on the token.
 //!
@@ -34,7 +34,6 @@ pub use crate::cursor::Cursor;
 use self::LiteralKind::*;
 use self::TokenKind::*;
 use crate::cursor::EOF_CHAR;
-use std::convert::TryFrom;
 
 /// Parsed token.
 /// It doesn't contain information about data that has been parsed,
@@ -88,7 +87,9 @@ pub enum TokenKind {
     /// tokens.
     UnknownPrefix,
 
-    /// Examples: `"12_u8"`, `"1.0e-40"`, `b"123`.
+    /// Examples: `12u8`, `1.0e-40`, `b"123"`. Note that `_` is an invalid
+    /// suffix, but may be present here on string and float literals. Users of
+    /// this type will need to check for and reject that case.
     ///
     /// See [LiteralKind] for more details.
     Literal { kind: LiteralKind, suffix_start: u32 },
@@ -165,11 +166,17 @@ pub enum DocStyle {
     Inner,
 }
 
+/// Enum representing the literal types supported by the lexer.
+///
+/// Note that the suffix is *not* considered when deciding the `LiteralKind` in
+/// this type. This means that float literals like `1f32` are classified by this
+/// type as `Int`. (Compare against `rustc_ast::token::LitKind` and
+/// `rustc_ast::ast::LitKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LiteralKind {
-    /// "12_u8", "0o100", "0b120i99"
+    /// "12_u8", "0o100", "0b120i99", "1f32".
     Int { base: Base, empty_int: bool },
-    /// "12.34f32", "0b100.100"
+    /// "12.34f32", "1e3", but not "1f32".
     Float { base: Base, empty_exponent: bool },
     /// "'a'", "'\\'", "'''", "';"
     Char { terminated: bool },
@@ -179,12 +186,16 @@ pub enum LiteralKind {
     Str { terminated: bool },
     /// "b"abc"", "b"abc"
     ByteStr { terminated: bool },
+    /// `c"abc"`, `c"abc`
+    CStr { terminated: bool },
     /// "r"abc"", "r#"abc"#", "r####"ab"###"c"####", "r#"a". `None` indicates
     /// an invalid literal.
     RawStr { n_hashes: Option<u8> },
     /// "br"abc"", "br#"abc"#", "br####"ab"###"c"####", "br#"a". `None`
     /// indicates an invalid literal.
     RawByteStr { n_hashes: Option<u8> },
+    /// `cr"abc"`, "cr#"abc"#", `cr#"a`. `None` indicates an invalid literal.
+    RawCStr { n_hashes: Option<u8> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -203,13 +214,13 @@ pub enum RawStrError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Base {
     /// Literal starts with "0b".
-    Binary,
+    Binary = 2,
     /// Literal starts with "0o".
-    Octal,
-    /// Literal starts with "0x".
-    Hexadecimal,
+    Octal = 8,
     /// Literal doesn't contain a prefix.
-    Decimal,
+    Decimal = 10,
+    /// Literal starts with "0x".
+    Hexadecimal = 16,
 }
 
 /// `rustc` allows files to have a shebang, e.g. "#!/usr/bin/rustrun",
@@ -350,39 +361,18 @@ impl Cursor<'_> {
             },
 
             // Byte literal, byte string literal, raw byte string literal or identifier.
-            'b' => match (self.first(), self.second()) {
-                ('\'', _) => {
-                    self.bump();
-                    let terminated = self.single_quoted_string();
-                    let suffix_start = self.pos_within_token();
-                    if terminated {
-                        self.eat_literal_suffix();
-                    }
-                    let kind = Byte { terminated };
-                    Literal { kind, suffix_start }
-                }
-                ('"', _) => {
-                    self.bump();
-                    let terminated = self.double_quoted_string();
-                    let suffix_start = self.pos_within_token();
-                    if terminated {
-                        self.eat_literal_suffix();
-                    }
-                    let kind = ByteStr { terminated };
-                    Literal { kind, suffix_start }
-                }
-                ('r', '"') | ('r', '#') => {
-                    self.bump();
-                    let res = self.raw_double_quoted_string(2);
-                    let suffix_start = self.pos_within_token();
-                    if res.is_ok() {
-                        self.eat_literal_suffix();
-                    }
-                    let kind = RawByteStr { n_hashes: res.ok() };
-                    Literal { kind, suffix_start }
-                }
-                _ => self.ident_or_unknown_prefix(),
-            },
+            'b' => self.c_or_byte_string(
+                |terminated| ByteStr { terminated },
+                |n_hashes| RawByteStr { n_hashes },
+                Some(|terminated| Byte { terminated }),
+            ),
+
+            // c-string literal, raw c-string literal or identifier.
+            'c' => self.c_or_byte_string(
+                |terminated| CStr { terminated },
+                |n_hashes| RawCStr { n_hashes },
+                None,
+            ),
 
             // Identifier (this should be checked after other variant that can
             // start as identifier).
@@ -546,39 +536,84 @@ impl Cursor<'_> {
         }
     }
 
+    fn c_or_byte_string(
+        &mut self,
+        mk_kind: impl FnOnce(bool) -> LiteralKind,
+        mk_kind_raw: impl FnOnce(Option<u8>) -> LiteralKind,
+        single_quoted: Option<fn(bool) -> LiteralKind>,
+    ) -> TokenKind {
+        match (self.first(), self.second(), single_quoted) {
+            ('\'', _, Some(mk_kind)) => {
+                self.bump();
+                let terminated = self.single_quoted_string();
+                let suffix_start = self.pos_within_token();
+                if terminated {
+                    self.eat_literal_suffix();
+                }
+                let kind = mk_kind(terminated);
+                Literal { kind, suffix_start }
+            }
+            ('"', _, _) => {
+                self.bump();
+                let terminated = self.double_quoted_string();
+                let suffix_start = self.pos_within_token();
+                if terminated {
+                    self.eat_literal_suffix();
+                }
+                let kind = mk_kind(terminated);
+                Literal { kind, suffix_start }
+            }
+            ('r', '"', _) | ('r', '#', _) => {
+                self.bump();
+                let res = self.raw_double_quoted_string(2);
+                let suffix_start = self.pos_within_token();
+                if res.is_ok() {
+                    self.eat_literal_suffix();
+                }
+                let kind = mk_kind_raw(res.ok());
+                Literal { kind, suffix_start }
+            }
+            _ => self.ident_or_unknown_prefix(),
+        }
+    }
+
     fn number(&mut self, first_digit: char) -> LiteralKind {
         debug_assert!('0' <= self.prev() && self.prev() <= '9');
         let mut base = Base::Decimal;
         if first_digit == '0' {
             // Attempt to parse encoding base.
-            let has_digits = match self.first() {
+            match self.first() {
                 'b' => {
                     base = Base::Binary;
                     self.bump();
-                    self.eat_decimal_digits()
+                    if !self.eat_decimal_digits() {
+                        return Int { base, empty_int: true };
+                    }
                 }
                 'o' => {
                     base = Base::Octal;
                     self.bump();
-                    self.eat_decimal_digits()
+                    if !self.eat_decimal_digits() {
+                        return Int { base, empty_int: true };
+                    }
                 }
                 'x' => {
                     base = Base::Hexadecimal;
                     self.bump();
-                    self.eat_hexadecimal_digits()
+                    if !self.eat_hexadecimal_digits() {
+                        return Int { base, empty_int: true };
+                    }
                 }
-                // Not a base prefix.
-                '0'..='9' | '_' | '.' | 'e' | 'E' => {
+                // Not a base prefix; consume additional digits.
+                '0'..='9' | '_' => {
                     self.eat_decimal_digits();
-                    true
                 }
+
+                // Also not a base prefix; nothing more to do here.
+                '.' | 'e' | 'E' => {}
+
                 // Just a 0.
                 _ => return Int { base, empty_int: false },
-            };
-            // Base prefix was provided, but there were no digits
-            // after it, e.g. "0x".
-            if !has_digits {
-                return Int { base, empty_int: true };
             }
         } else {
             // No base prefix, parse number in the usual way.
@@ -840,12 +875,13 @@ impl Cursor<'_> {
         self.eat_decimal_digits()
     }
 
-    // Eats the suffix of the literal, e.g. "_u8".
+    // Eats the suffix of the literal, e.g. "u8".
     fn eat_literal_suffix(&mut self) {
         self.eat_identifier();
     }
 
-    // Eats the identifier.
+    // Eats the identifier. Note: succeeds on `_`, which isn't a valid
+    // identifier.
     fn eat_identifier(&mut self) {
         if !is_id_start(self.first()) {
             return;

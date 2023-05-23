@@ -1,7 +1,8 @@
 use super::{AllocId, AllocRange, ConstAlloc, Pointer, Scalar};
 
 use crate::mir::interpret::ConstValue;
-use crate::ty::{layout, query::TyCtxtAt, tls, Ty, ValTree};
+use crate::query::TyCtxtAt;
+use crate::ty::{layout, tls, Ty, ValTree};
 
 use rustc_data_structures::sync::Lock;
 use rustc_errors::{pluralize, struct_span_err, DiagnosticBuilder, ErrorGuaranteed};
@@ -15,17 +16,49 @@ use std::{any::Any, backtrace::Backtrace, fmt};
 pub enum ErrorHandled {
     /// Already reported an error for this evaluation, and the compilation is
     /// *guaranteed* to fail. Warnings/lints *must not* produce `Reported`.
-    Reported(ErrorGuaranteed),
-    /// Already emitted a lint for this evaluation.
-    Linted,
+    Reported(ReportedErrorInfo),
     /// Don't emit an error, the evaluation failed because the MIR was generic
     /// and the substs didn't fully monomorphize it.
     TooGeneric,
 }
 
 impl From<ErrorGuaranteed> for ErrorHandled {
-    fn from(err: ErrorGuaranteed) -> ErrorHandled {
-        ErrorHandled::Reported(err)
+    #[inline]
+    fn from(error: ErrorGuaranteed) -> ErrorHandled {
+        ErrorHandled::Reported(error.into())
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
+pub struct ReportedErrorInfo {
+    error: ErrorGuaranteed,
+    is_tainted_by_errors: bool,
+}
+
+impl ReportedErrorInfo {
+    #[inline]
+    pub fn tainted_by_errors(error: ErrorGuaranteed) -> ReportedErrorInfo {
+        ReportedErrorInfo { is_tainted_by_errors: true, error }
+    }
+
+    /// Returns true if evaluation failed because MIR was tainted by errors.
+    #[inline]
+    pub fn is_tainted_by_errors(self) -> bool {
+        self.is_tainted_by_errors
+    }
+}
+
+impl From<ErrorGuaranteed> for ReportedErrorInfo {
+    #[inline]
+    fn from(error: ErrorGuaranteed) -> ReportedErrorInfo {
+        ReportedErrorInfo { is_tainted_by_errors: false, error }
+    }
+}
+
+impl Into<ErrorGuaranteed> for ReportedErrorInfo {
+    #[inline]
+    fn into(self) -> ErrorGuaranteed {
+        self.error
     }
 }
 
@@ -89,21 +122,9 @@ fn print_backtrace(backtrace: &Backtrace) {
     eprintln!("\n\nAn error occurred in miri:\n{}", backtrace);
 }
 
-impl From<ErrorHandled> for InterpErrorInfo<'_> {
-    fn from(err: ErrorHandled) -> Self {
-        match err {
-            ErrorHandled::Reported(ErrorGuaranteed { .. }) | ErrorHandled::Linted => {
-                err_inval!(ReferencedConstant)
-            }
-            ErrorHandled::TooGeneric => err_inval!(TooGeneric),
-        }
-        .into()
-    }
-}
-
 impl From<ErrorGuaranteed> for InterpErrorInfo<'_> {
     fn from(err: ErrorGuaranteed) -> Self {
-        InterpError::InvalidProgram(InvalidProgramInfo::AlreadyReported(err)).into()
+        InterpError::InvalidProgram(InvalidProgramInfo::AlreadyReported(err.into())).into()
     }
 }
 
@@ -138,11 +159,8 @@ impl<'tcx> From<InterpError<'tcx>> for InterpErrorInfo<'tcx> {
 pub enum InvalidProgramInfo<'tcx> {
     /// Resolution can fail if we are in a too generic context.
     TooGeneric,
-    /// Cannot compute this constant because it depends on another one
-    /// which already produced an error.
-    ReferencedConstant,
     /// Abort in case errors are already reported.
-    AlreadyReported(ErrorGuaranteed),
+    AlreadyReported(ReportedErrorInfo),
     /// An error occurred during layout computation.
     Layout(layout::LayoutError<'tcx>),
     /// An error occurred during FnAbi computation: the passed --target lacks FFI support
@@ -151,6 +169,9 @@ pub enum InvalidProgramInfo<'tcx> {
     FnAbiAdjustForForeignAbi(call::AdjustForForeignAbiError),
     /// SizeOf of unsized type was requested.
     SizeOfUnsizedType(Ty<'tcx>),
+    /// An unsized local was accessed without having been initialized.
+    /// This is not meaningful as we can't even have backing memory for such locals.
+    UninitUnsizedLocal,
 }
 
 impl fmt::Display for InvalidProgramInfo<'_> {
@@ -158,13 +179,16 @@ impl fmt::Display for InvalidProgramInfo<'_> {
         use InvalidProgramInfo::*;
         match self {
             TooGeneric => write!(f, "encountered overly generic constant"),
-            ReferencedConstant => write!(f, "referenced constant has errors"),
-            AlreadyReported(ErrorGuaranteed { .. }) => {
-                write!(f, "encountered constants with type errors, stopping evaluation")
+            AlreadyReported(_) => {
+                write!(
+                    f,
+                    "an error has already been reported elsewhere (this should not usually be printed)"
+                )
             }
             Layout(ref err) => write!(f, "{err}"),
             FnAbiAdjustForForeignAbi(ref err) => write!(f, "{err}"),
             SizeOfUnsizedType(ty) => write!(f, "size_of called on unsized type `{ty}`"),
+            UninitUnsizedLocal => write!(f, "unsized local is used while uninitialized"),
         }
     }
 }
@@ -338,7 +362,7 @@ impl fmt::Display for UndefinedBehaviorInfo {
                 write!(
                     f,
                     "{msg}{pointer} is a dangling pointer (it has no provenance)",
-                    pointer = Pointer::<Option<AllocId>>::from_addr(*i),
+                    pointer = Pointer::<Option<AllocId>>::from_addr_invalid(*i),
                 )
             }
             AlignmentCheckFailed { required, has } => write!(
@@ -401,16 +425,15 @@ impl fmt::Display for UndefinedBehaviorInfo {
 pub enum UnsupportedOpInfo {
     /// Free-form case. Only for errors that are never caught!
     Unsupported(String),
-    /// Overwriting parts of a pointer; the resulting state cannot be represented in our
-    /// `Allocation` data structure. See <https://github.com/rust-lang/miri/issues/2181>.
-    PartialPointerOverwrite(Pointer<AllocId>),
-    /// Attempting to `copy` parts of a pointer to somewhere else; the resulting state cannot be
-    /// represented in our `Allocation` data structure. See
-    /// <https://github.com/rust-lang/miri/issues/2181>.
-    PartialPointerCopy(Pointer<AllocId>),
     //
     // The variants below are only reachable from CTFE/const prop, miri will never emit them.
     //
+    /// Overwriting parts of a pointer; without knowing absolute addresses, the resulting state
+    /// cannot be represented by the CTFE interpreter.
+    PartialPointerOverwrite(Pointer<AllocId>),
+    /// Attempting to `copy` parts of a pointer to somewhere else; without knowing absolute
+    /// addresses, the resulting state cannot be represented by the CTFE interpreter.
+    PartialPointerCopy(Pointer<AllocId>),
     /// Encountered a pointer where we needed raw bytes.
     ReadPointerAsBytes,
     /// Accessing thread local statics
@@ -446,8 +469,10 @@ pub enum ResourceExhaustionInfo {
     ///
     /// The exact limit is set by the `const_eval_limit` attribute.
     StepLimitReached,
-    /// There is not enough memory to perform an allocation.
+    /// There is not enough memory (on the host) to perform an allocation.
     MemoryExhausted,
+    /// The address space (of the target) is full.
+    AddressSpaceFull,
 }
 
 impl fmt::Display for ResourceExhaustionInfo {
@@ -462,6 +487,9 @@ impl fmt::Display for ResourceExhaustionInfo {
             }
             MemoryExhausted => {
                 write!(f, "tried to allocate more memory than available to compiler")
+            }
+            AddressSpaceFull => {
+                write!(f, "there are no more free addresses in the address space")
             }
         }
     }

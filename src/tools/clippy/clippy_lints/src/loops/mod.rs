@@ -7,9 +7,9 @@ mod iter_next_loop;
 mod manual_find;
 mod manual_flatten;
 mod manual_memcpy;
+mod manual_while_let_some;
 mod missing_spin_loop;
 mod mut_range_bound;
-mod needless_collect;
 mod needless_range_loop;
 mod never_loop;
 mod same_item_push;
@@ -62,7 +62,8 @@ declare_clippy_lint! {
     ///
     /// ### Why is this bad?
     /// Just iterating the collection itself makes the intent
-    /// more clear and is probably faster.
+    /// more clear and is probably faster because it eliminates
+    /// the bounds check that is done when indexing.
     ///
     /// ### Example
     /// ```rust
@@ -203,28 +204,6 @@ declare_clippy_lint! {
     pub WHILE_LET_LOOP,
     complexity,
     "`loop { if let { ... } else break }`, which can be written as a `while let` loop"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for functions collecting an iterator when collect
-    /// is not needed.
-    ///
-    /// ### Why is this bad?
-    /// `collect` causes the allocation of a new data structure,
-    /// when this allocation may not be needed.
-    ///
-    /// ### Example
-    /// ```rust
-    /// # let iterator = vec![1].into_iter();
-    /// let len = iterator.clone().collect::<Vec<_>>().len();
-    /// // should be
-    /// let len = iterator.count();
-    /// ```
-    #[clippy::version = "1.30.0"]
-    pub NEEDLESS_COLLECT,
-    perf,
-    "collecting an iterator when collect is not needed"
 }
 
 declare_clippy_lint! {
@@ -597,6 +576,36 @@ declare_clippy_lint! {
     "manual implementation of `Iterator::find`"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Looks for loops that check for emptiness of a `Vec` in the condition and pop an element
+    /// in the body as a separate operation.
+    ///
+    /// ### Why is this bad?
+    /// Such loops can be written in a more idiomatic way by using a while-let loop and directly
+    /// pattern matching on the return value of `Vec::pop()`.
+    ///
+    /// ### Example
+    /// ```rust
+    /// let mut numbers = vec![1, 2, 3, 4, 5];
+    /// while !numbers.is_empty() {
+    ///     let number = numbers.pop().unwrap();
+    ///     // use `number`
+    /// }
+    /// ```
+    /// Use instead:
+    /// ```rust
+    /// let mut numbers = vec![1, 2, 3, 4, 5];
+    /// while let Some(number) = numbers.pop() {
+    ///     // use `number`
+    /// }
+    /// ```
+    #[clippy::version = "1.70.0"]
+    pub MANUAL_WHILE_LET_SOME,
+    style,
+    "checking for emptiness of a `Vec` in the loop condition and popping an element in the body"
+}
+
 declare_lint_pass!(Loops => [
     MANUAL_MEMCPY,
     MANUAL_FLATTEN,
@@ -605,7 +614,6 @@ declare_lint_pass!(Loops => [
     EXPLICIT_INTO_ITER_LOOP,
     ITER_NEXT_LOOP,
     WHILE_LET_LOOP,
-    NEEDLESS_COLLECT,
     EXPLICIT_COUNTER_LOOP,
     EMPTY_LOOP,
     WHILE_LET_ON_ITERATOR,
@@ -617,6 +625,7 @@ declare_lint_pass!(Loops => [
     SINGLE_ELEMENT_LOOP,
     MISSING_SPIN_LOOP,
     MANUAL_FIND,
+    MANUAL_WHILE_LET_SOME
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Loops {
@@ -663,12 +672,11 @@ impl<'tcx> LateLintPass<'tcx> for Loops {
 
         while_let_on_iterator::check(cx, expr);
 
-        if let Some(higher::While { condition, body }) = higher::While::hir(expr) {
+        if let Some(higher::While { condition, body, span }) = higher::While::hir(expr) {
             while_immutable_condition::check(cx, condition, body);
             missing_spin_loop::check(cx, condition, body);
+            manual_while_let_some::check(cx, condition, body, span);
         }
-
-        needless_collect::check(expr, cx);
     }
 }
 

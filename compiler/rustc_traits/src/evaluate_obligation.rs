@@ -1,5 +1,5 @@
 use rustc_infer::infer::{DefiningAnchor, TyCtxtInferExt};
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::{ParamEnvAnd, TyCtxt};
 use rustc_span::source_map::DUMMY_SP;
 use rustc_trait_selection::traits::query::CanonicalPredicateGoal;
@@ -26,7 +26,7 @@ fn evaluate_obligation<'tcx>(
     let ParamEnvAnd { param_env, value: predicate } = goal;
 
     let mut selcx = SelectionContext::with_query_mode(&infcx, TraitQueryMode::Canonical);
-    let obligation = Obligation::new(ObligationCause::dummy(), param_env, predicate);
+    let obligation = Obligation::new(tcx, ObligationCause::dummy(), param_env, predicate);
 
     selcx.evaluate_root_obligation(&obligation)
 }

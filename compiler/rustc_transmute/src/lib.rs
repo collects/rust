@@ -1,4 +1,4 @@
-#![feature(alloc_layout_extra, control_flow_enum, decl_macro, iterator_try_reduce, never_type)]
+#![feature(alloc_layout_extra, decl_macro, iterator_try_reduce, never_type)]
 #![allow(dead_code, unused_variables)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
@@ -62,16 +62,15 @@ mod rustc {
 
     use rustc_hir::lang_items::LangItem;
     use rustc_infer::infer::InferCtxt;
-    use rustc_macros::{TypeFoldable, TypeVisitable};
+    use rustc_macros::TypeVisitable;
     use rustc_middle::traits::ObligationCause;
-    use rustc_middle::ty::Binder;
     use rustc_middle::ty::Const;
     use rustc_middle::ty::ParamEnv;
     use rustc_middle::ty::Ty;
     use rustc_middle::ty::TyCtxt;
 
     /// The source and destination types of a transmutation.
-    #[derive(TypeFoldable, TypeVisitable, Debug, Clone, Copy)]
+    #[derive(TypeVisitable, Debug, Clone, Copy)]
     pub struct Types<'tcx> {
         /// The source type.
         pub src: Ty<'tcx>,
@@ -92,15 +91,13 @@ mod rustc {
         pub fn is_transmutable(
             &mut self,
             cause: ObligationCause<'tcx>,
-            src_and_dst: Binder<'tcx, Types<'tcx>>,
+            types: Types<'tcx>,
             scope: Ty<'tcx>,
             assume: crate::Assume,
         ) -> crate::Answer<crate::layout::rustc::Ref<'tcx>> {
-            let src = src_and_dst.map_bound(|types| types.src).skip_binder();
-            let dst = src_and_dst.map_bound(|types| types.dst).skip_binder();
             crate::maybe_transmutable::MaybeTransmutableQuery::new(
-                src,
-                dst,
+                types.src,
+                types.dst,
                 scope,
                 assume,
                 self.infcx.tcx,
@@ -117,12 +114,12 @@ mod rustc {
             c: Const<'tcx>,
         ) -> Option<Self> {
             use rustc_middle::ty::ScalarInt;
-            use rustc_middle::ty::TypeVisitable;
+            use rustc_middle::ty::TypeVisitableExt;
             use rustc_span::symbol::sym;
 
             let c = c.eval(tcx, param_env);
 
-            if let Some(err) = c.error_reported() {
+            if let Err(err) = c.error_reported() {
                 return Some(Self {
                     alignment: true,
                     lifetimes: true,
@@ -149,7 +146,7 @@ mod rustc {
                     .iter()
                     .enumerate()
                     .find(|(_, field_def)| name == field_def.name)
-                    .expect(&format!("There were no fields named `{name}`."));
+                    .unwrap_or_else(|| panic!("There were no fields named `{name}`."));
                 fields[field_idx].unwrap_leaf() == ScalarInt::TRUE
             };
 

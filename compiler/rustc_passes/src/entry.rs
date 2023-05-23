@@ -1,10 +1,11 @@
+use rustc_ast::attr;
 use rustc_ast::entry::EntryPointType;
 use rustc_errors::error_code;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_hir::{ItemId, Node, CRATE_HIR_ID};
-use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::{DefIdTree, TyCtxt};
+use rustc_middle::query::Providers;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{sigpipe, CrateType, EntryFnType};
 use rustc_session::parse::feature_err;
 use rustc_span::symbol::sym;
@@ -37,7 +38,7 @@ fn entry_fn(tcx: TyCtxt<'_>, (): ()) -> Option<(DefId, EntryFnType)> {
     }
 
     // If the user wants no main function at all, then stop here.
-    if tcx.sess.contains_name(&tcx.hir().attrs(CRATE_HIR_ID), sym::no_main) {
+    if attr::contains_name(&tcx.hir().attrs(CRATE_HIR_ID), sym::no_main) {
         return None;
     }
 
@@ -57,12 +58,12 @@ fn entry_fn(tcx: TyCtxt<'_>, (): ()) -> Option<(DefId, EntryFnType)> {
 // An equivalent optimization was not applied to the duplicated code in test_harness.rs.
 fn entry_point_type(ctxt: &EntryContext<'_>, id: ItemId, at_root: bool) -> EntryPointType {
     let attrs = ctxt.tcx.hir().attrs(id.hir_id());
-    if ctxt.tcx.sess.contains_name(attrs, sym::start) {
+    if attr::contains_name(attrs, sym::start) {
         EntryPointType::Start
-    } else if ctxt.tcx.sess.contains_name(attrs, sym::rustc_main) {
+    } else if attr::contains_name(attrs, sym::rustc_main) {
         EntryPointType::RustcMainAttr
     } else {
-        if let Some(name) = ctxt.tcx.opt_item_name(id.def_id.to_def_id())
+        if let Some(name) = ctxt.tcx.opt_item_name(id.owner_id.to_def_id())
             && name == sym::main {
             if at_root {
                 // This is a top-level function so can be `main`.
@@ -78,11 +79,11 @@ fn entry_point_type(ctxt: &EntryContext<'_>, id: ItemId, at_root: bool) -> Entry
 
 fn attr_span_by_symbol(ctxt: &EntryContext<'_>, id: ItemId, sym: Symbol) -> Option<Span> {
     let attrs = ctxt.tcx.hir().attrs(id.hir_id());
-    ctxt.tcx.sess.find_by_name(attrs, sym).map(|attr| attr.span)
+    attr::find_by_name(attrs, sym).map(|attr| attr.span)
 }
 
 fn find_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
-    let at_root = ctxt.tcx.opt_local_parent(id.def_id.def_id) == Some(CRATE_DEF_ID);
+    let at_root = ctxt.tcx.opt_local_parent(id.owner_id.def_id) == Some(CRATE_DEF_ID);
 
     match entry_point_type(ctxt, id, at_root) {
         EntryPointType::None => {
@@ -90,7 +91,7 @@ fn find_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
                 ctxt.tcx.sess.emit_err(AttrOnlyOnMain { span, attr: sym::unix_sigpipe });
             }
         }
-        _ if !matches!(ctxt.tcx.def_kind(id.def_id), DefKind::Fn) => {
+        _ if !matches!(ctxt.tcx.def_kind(id.owner_id), DefKind::Fn) => {
             for attr in [sym::start, sym::rustc_main] {
                 if let Some(span) = attr_span_by_symbol(ctxt, id, attr) {
                     ctxt.tcx.sess.emit_err(AttrOnlyInFunctions { span, attr });
@@ -102,16 +103,16 @@ fn find_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
             if let Some(span) = attr_span_by_symbol(ctxt, id, sym::unix_sigpipe) {
                 ctxt.tcx.sess.emit_err(AttrOnlyOnRootMain { span, attr: sym::unix_sigpipe });
             }
-            ctxt.non_main_fns.push(ctxt.tcx.def_span(id.def_id));
+            ctxt.non_main_fns.push(ctxt.tcx.def_span(id.owner_id));
         }
         EntryPointType::RustcMainAttr => {
             if ctxt.attr_main_fn.is_none() {
-                ctxt.attr_main_fn = Some((id.def_id.def_id, ctxt.tcx.def_span(id.def_id)));
+                ctxt.attr_main_fn = Some((id.owner_id.def_id, ctxt.tcx.def_span(id.owner_id)));
             } else {
                 ctxt.tcx.sess.emit_err(MultipleRustcMain {
-                    span: ctxt.tcx.def_span(id.def_id.to_def_id()),
+                    span: ctxt.tcx.def_span(id.owner_id.to_def_id()),
                     first: ctxt.attr_main_fn.unwrap().1,
-                    additional: ctxt.tcx.def_span(id.def_id.to_def_id()),
+                    additional: ctxt.tcx.def_span(id.owner_id.to_def_id()),
                 });
             }
         }
@@ -120,11 +121,11 @@ fn find_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
                 ctxt.tcx.sess.emit_err(AttrOnlyOnMain { span, attr: sym::unix_sigpipe });
             }
             if ctxt.start_fn.is_none() {
-                ctxt.start_fn = Some((id.def_id.def_id, ctxt.tcx.def_span(id.def_id)));
+                ctxt.start_fn = Some((id.owner_id.def_id, ctxt.tcx.def_span(id.owner_id)));
             } else {
                 ctxt.tcx.sess.emit_err(MultipleStartFunctions {
-                    span: ctxt.tcx.def_span(id.def_id),
-                    labeled: ctxt.tcx.def_span(id.def_id.to_def_id()),
+                    span: ctxt.tcx.def_span(id.owner_id),
+                    labeled: ctxt.tcx.def_span(id.owner_id.to_def_id()),
                     previous: ctxt.start_fn.unwrap().1,
                 });
             }
@@ -186,7 +187,7 @@ fn sigpipe(tcx: TyCtxt<'_>, def_id: DefId) -> u8 {
 
 fn no_main_err(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) {
     let sp = tcx.def_span(CRATE_DEF_ID);
-    if *tcx.sess.parse_sess.reached_eof.borrow() {
+    if tcx.sess.parse_sess.reached_eof.load(rustc_data_structures::sync::Ordering::Relaxed) {
         // There's an unclosed brace that made the parser reach `Eof`, we shouldn't complain about
         // the missing `fn main()` then as it might have been hidden inside an unclosed block.
         tcx.sess.delay_span_bug(sp, "`main` not found, but expected unclosed brace error");
@@ -195,7 +196,7 @@ fn no_main_err(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) {
 
     // There is no main function.
     let mut has_filename = true;
-    let filename = tcx.sess.local_crate_source_file.clone().unwrap_or_else(|| {
+    let filename = tcx.sess.local_crate_source_file().unwrap_or_else(|| {
         has_filename = false;
         Default::default()
     });
@@ -205,7 +206,7 @@ fn no_main_err(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) {
     // The file may be empty, which leads to the diagnostic machinery not emitting this
     // note. This is a relatively simple way to detect that case and emit a span-less
     // note instead.
-    let file_empty = !tcx.sess.source_map().lookup_line(sp.hi()).is_ok();
+    let file_empty = tcx.sess.source_map().lookup_line(sp.hi()).is_err();
 
     tcx.sess.emit_err(NoMainErr {
         sp,

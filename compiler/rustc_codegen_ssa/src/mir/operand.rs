@@ -2,6 +2,7 @@ use super::place::PlaceRef;
 use super::{FunctionCx, LocalRef};
 
 use crate::base;
+use crate::common::TypeKind;
 use crate::glue;
 use crate::traits::*;
 use crate::MemFlags;
@@ -23,10 +24,26 @@ pub enum OperandValue<V> {
     /// to be valid for the operand's lifetime.
     /// The second value, if any, is the extra data (vtable or length)
     /// which indicates that it refers to an unsized rvalue.
+    ///
+    /// An `OperandValue` has this variant for types which are neither
+    /// `Immediate` nor `Pair`s. The backend value in this variant must be a
+    /// pointer to the *non*-immediate backend type. That pointee type is the
+    /// one returned by [`LayoutTypeMethods::backend_type`].
     Ref(V, Option<V>, Align),
-    /// A single LLVM value.
+    /// A single LLVM immediate value.
+    ///
+    /// An `OperandValue` *must* be this variant for any type for which
+    /// [`LayoutTypeMethods::is_backend_immediate`] returns `true`.
+    /// The backend value in this variant must be the *immediate* backend type,
+    /// as returned by [`LayoutTypeMethods::immediate_backend_type`].
     Immediate(V),
     /// A pair of immediate LLVM values. Used by fat pointers too.
+    ///
+    /// An `OperandValue` *must* be this variant for any type for which
+    /// [`LayoutTypeMethods::is_backend_scalar_pair`] returns `true`.
+    /// The backend values in this variant must be the *immediate* backend types,
+    /// as returned by [`LayoutTypeMethods::scalar_pair_element_backend_type`]
+    /// with `immediate: true`.
     Pair(V, V),
 }
 
@@ -40,10 +57,10 @@ pub enum OperandValue<V> {
 /// instead.
 #[derive(Copy, Clone)]
 pub struct OperandRef<'tcx, V> {
-    // The value.
+    /// The value.
     pub val: OperandValue<V>,
 
-    // The layout of value, based on its Rust type.
+    /// The layout of value, based on its Rust type.
     pub layout: TyAndLayout<'tcx>,
 }
 
@@ -60,7 +77,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
     ) -> OperandRef<'tcx, V> {
         assert!(layout.is_zst());
         OperandRef {
-            val: OperandValue::Immediate(bx.const_undef(bx.immediate_backend_type(layout))),
+            val: OperandValue::Immediate(bx.const_poison(bx.immediate_backend_type(layout))),
             layout,
         }
     }
@@ -145,7 +162,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
             let llty = bx.cx().backend_type(self.layout);
             debug!("Operand::immediate_or_packed_pair: packing {:?} into {:?}", self, llty);
             // Reconstruct the immediate aggregate.
-            let mut llpair = bx.cx().const_undef(llty);
+            let mut llpair = bx.cx().const_poison(llty);
             let imm_a = bx.from_immediate(a);
             let imm_b = bx.from_immediate(b);
             llpair = bx.insert_value(llpair, imm_a, 0);
@@ -220,19 +237,47 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
         };
 
         match (&mut val, field.abi) {
-            (OperandValue::Immediate(llval), _) => {
+            (
+                OperandValue::Immediate(llval),
+                Abi::Scalar(_) | Abi::ScalarPair(..) | Abi::Vector { .. },
+            ) => {
                 // Bools in union fields needs to be truncated.
                 *llval = bx.to_immediate(*llval, field);
                 // HACK(eddyb) have to bitcast pointers until LLVM removes pointee types.
-                *llval = bx.bitcast(*llval, bx.cx().immediate_backend_type(field));
+                let ty = bx.cx().immediate_backend_type(field);
+                if bx.type_kind(ty) == TypeKind::Pointer {
+                    *llval = bx.pointercast(*llval, ty);
+                }
             }
             (OperandValue::Pair(a, b), Abi::ScalarPair(a_abi, b_abi)) => {
                 // Bools in union fields needs to be truncated.
                 *a = bx.to_immediate_scalar(*a, a_abi);
                 *b = bx.to_immediate_scalar(*b, b_abi);
                 // HACK(eddyb) have to bitcast pointers until LLVM removes pointee types.
-                *a = bx.bitcast(*a, bx.cx().scalar_pair_element_backend_type(field, 0, true));
-                *b = bx.bitcast(*b, bx.cx().scalar_pair_element_backend_type(field, 1, true));
+                let a_ty = bx.cx().scalar_pair_element_backend_type(field, 0, true);
+                let b_ty = bx.cx().scalar_pair_element_backend_type(field, 1, true);
+                if bx.type_kind(a_ty) == TypeKind::Pointer {
+                    *a = bx.pointercast(*a, a_ty);
+                }
+                if bx.type_kind(b_ty) == TypeKind::Pointer {
+                    *b = bx.pointercast(*b, b_ty);
+                }
+            }
+            // Newtype vector of array, e.g. #[repr(simd)] struct S([i32; 4]);
+            (OperandValue::Immediate(llval), Abi::Aggregate { sized: true }) => {
+                assert!(matches!(self.layout.abi, Abi::Vector { .. }));
+
+                let llty = bx.cx().backend_type(self.layout);
+                let llfield_ty = bx.cx().backend_type(field);
+
+                // Can't bitcast an aggregate, so round trip through memory.
+                let lltemp = bx.alloca(llfield_ty, field.align.abi);
+                let llptr = bx.pointercast(lltemp, bx.cx().type_ptr_to(llty));
+                bx.store(*llval, llptr, field.align.abi);
+                *llval = bx.load(llfield_ty, lltemp, field.align.abi);
+            }
+            (OperandValue::Immediate(_), Abi::Uninhabited | Abi::Aggregate { sized: false }) => {
+                bug!()
             }
             (OperandValue::Pair(..), _) => bug!(),
             (OperandValue::Ref(..), _) => bug!(),
@@ -243,6 +288,31 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
 }
 
 impl<'a, 'tcx, V: CodegenObject> OperandValue<V> {
+    /// Returns an `OperandValue` that's generally UB to use in any way.
+    ///
+    /// Depending on the `layout`, returns an `Immediate` or `Pair` containing
+    /// poison value(s), or a `Ref` containing a poison pointer.
+    ///
+    /// Supports sized types only.
+    pub fn poison<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+        bx: &mut Bx,
+        layout: TyAndLayout<'tcx>,
+    ) -> OperandValue<V> {
+        assert!(layout.is_sized());
+        if bx.cx().is_backend_immediate(layout) {
+            let ibty = bx.cx().immediate_backend_type(layout);
+            OperandValue::Immediate(bx.const_poison(ibty))
+        } else if bx.cx().is_backend_scalar_pair(layout) {
+            let ibty0 = bx.cx().scalar_pair_element_backend_type(layout, 0, true);
+            let ibty1 = bx.cx().scalar_pair_element_backend_type(layout, 1, true);
+            OperandValue::Pair(bx.const_poison(ibty0), bx.const_poison(ibty1))
+        } else {
+            let bty = bx.cx().backend_type(layout);
+            let ptr_bty = bx.cx().type_ptr_to(bty);
+            OperandValue::Ref(bx.const_poison(ptr_bty), None, layout.align.abi)
+        }
+    }
+
     pub fn store<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
         self,
         bx: &mut Bx,
@@ -332,8 +402,6 @@ impl<'a, 'tcx, V: CodegenObject> OperandValue<V> {
         indirect_dest: PlaceRef<'tcx, V>,
     ) {
         debug!("OperandRef::store_unsized: operand={:?}, indirect_dest={:?}", self, indirect_dest);
-        let flags = MemFlags::empty();
-
         // `indirect_dest` must have `*mut T` type. We extract `T` out of it.
         let unsized_ty = indirect_dest
             .layout
@@ -346,17 +414,23 @@ impl<'a, 'tcx, V: CodegenObject> OperandValue<V> {
             bug!("store_unsized called with a sized value")
         };
 
-        // FIXME: choose an appropriate alignment, or use dynamic align somehow
-        let max_align = Align::from_bits(128).unwrap();
-        let min_align = Align::from_bits(8).unwrap();
-
-        // Allocate an appropriate region on the stack, and copy the value into it
-        let (llsize, _) = glue::size_and_align_of_dst(bx, unsized_ty, Some(llextra));
-        let lldst = bx.byte_array_alloca(llsize, max_align);
-        bx.memcpy(lldst, max_align, llptr, min_align, llsize, flags);
+        // Allocate an appropriate region on the stack, and copy the value into it. Since alloca
+        // doesn't support dynamic alignment, we allocate an extra align - 1 bytes, and align the
+        // pointer manually.
+        let (size, align) = glue::size_and_align_of_dst(bx, unsized_ty, Some(llextra));
+        let one = bx.const_usize(1);
+        let align_minus_1 = bx.sub(align, one);
+        let size_extra = bx.add(size, align_minus_1);
+        let min_align = Align::ONE;
+        let alloca = bx.byte_array_alloca(size_extra, min_align);
+        let address = bx.ptrtoint(alloca, bx.type_isize());
+        let neg_address = bx.neg(address);
+        let offset = bx.and(neg_address, align_minus_1);
+        let dst = bx.inbounds_gep(bx.type_i8(), alloca, &[offset]);
+        bx.memcpy(dst, min_align, llptr, min_align, size, MemFlags::empty());
 
         // Store the allocated region and the extra to the indirect place.
-        let indirect_operand = OperandValue::Pair(lldst, llextra);
+        let indirect_operand = OperandValue::Pair(dst, llextra);
         indirect_operand.store(bx, indirect_dest);
     }
 }
@@ -370,7 +444,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         debug!("maybe_codegen_consume_direct(place_ref={:?})", place_ref);
 
         match self.locals[place_ref.local] {
-            LocalRef::Operand(Some(mut o)) => {
+            LocalRef::Operand(mut o) => {
                 // Moves out of scalar and scalar pair fields are trivial.
                 for elem in place_ref.projection.iter() {
                     match elem {
@@ -395,7 +469,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                 Some(o)
             }
-            LocalRef::Operand(None) => {
+            LocalRef::PendingOperand => {
                 bug!("use of {:?} before def", place_ref);
             }
             LocalRef::Place(..) | LocalRef::UnsizedPlace(..) => {

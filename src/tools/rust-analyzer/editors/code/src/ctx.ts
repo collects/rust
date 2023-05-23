@@ -2,14 +2,27 @@ import * as vscode from "vscode";
 import * as lc from "vscode-languageclient/node";
 import * as ra from "./lsp_ext";
 
-import { Config, substituteVariablesInEnv, substituteVSCodeVariables } from "./config";
+import { Config, prepareVSCodeConfig } from "./config";
 import { createClient } from "./client";
-import { isRustEditor, log, RustEditor } from "./util";
+import {
+    executeDiscoverProject,
+    isRustDocument,
+    isRustEditor,
+    LazyOutputChannel,
+    log,
+    RustEditor,
+} from "./util";
 import { ServerStatusParams } from "./lsp_ext";
 import { PersistentState } from "./persistent_state";
 import { bootstrap } from "./bootstrap";
+import { ExecOptions } from "child_process";
+
+// We only support local folders, not eg. Live Share (`vlsl:` scheme), so don't activate if
+// only those are in use. We use "Empty" to represent these scenarios
+// (r-a still somewhat works with Live Share, because commands are tunneled to the host)
 
 export type Workspace =
+    | { kind: "Empty" }
     | {
           kind: "Workspace Folder";
       }
@@ -18,16 +31,50 @@ export type Workspace =
           files: vscode.TextDocument[];
       };
 
+export function fetchWorkspace(): Workspace {
+    const folders = (vscode.workspace.workspaceFolders || []).filter(
+        (folder) => folder.uri.scheme === "file"
+    );
+    const rustDocuments = vscode.workspace.textDocuments.filter((document) =>
+        isRustDocument(document)
+    );
+
+    return folders.length === 0
+        ? rustDocuments.length === 0
+            ? { kind: "Empty" }
+            : {
+                  kind: "Detached Files",
+                  files: rustDocuments,
+              }
+        : { kind: "Workspace Folder" };
+}
+
+export async function discoverWorkspace(
+    files: readonly vscode.TextDocument[],
+    command: string[],
+    options: ExecOptions
+): Promise<JsonProject> {
+    const paths = files.map((f) => `"${f.uri.fsPath}"`).join(" ");
+    const joinedCommand = command.join(" ");
+    const data = await executeDiscoverProject(`${joinedCommand} ${paths}`, options);
+    return JSON.parse(data) as JsonProject;
+}
+
 export type CommandFactory = {
-    enabled: (ctx: Ctx) => Cmd;
+    enabled: (ctx: CtxInit) => Cmd;
     disabled?: (ctx: Ctx) => Cmd;
+};
+
+export type CtxInit = Ctx & {
+    readonly client: lc.LanguageClient;
 };
 
 export class Ctx {
     readonly statusBar: vscode.StatusBarItem;
-    readonly config: Config;
+    config: Config;
+    readonly workspace: Workspace;
 
-    private client: lc.LanguageClient | undefined;
+    private _client: lc.LanguageClient | undefined;
     private _serverPath: string | undefined;
     private traceOutputChannel: vscode.OutputChannel | undefined;
     private outputChannel: vscode.OutputChannel | undefined;
@@ -36,18 +83,17 @@ export class Ctx {
     private commandFactories: Record<string, CommandFactory>;
     private commandDisposables: Disposable[];
 
-    workspace: Workspace;
+    get client() {
+        return this._client;
+    }
 
     constructor(
         readonly extCtx: vscode.ExtensionContext,
-        workspace: Workspace,
-        commandFactories: Record<string, CommandFactory>
+        commandFactories: Record<string, CommandFactory>,
+        workspace: Workspace
     ) {
         extCtx.subscriptions.push(this);
         this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
-        this.statusBar.text = "rust-analyzer";
-        this.statusBar.tooltip = "ready";
-        this.statusBar.command = "rust-analyzer.analyzerStatus";
         this.statusBar.show();
         this.workspace = workspace;
         this.clientSubscriptions = [];
@@ -57,7 +103,10 @@ export class Ctx {
         this.state = new PersistentState(extCtx.globalState);
         this.config = new Config(extCtx);
 
-        this.updateCommands();
+        this.updateCommands("disable");
+        this.setServerStatus({
+            health: "stopped",
+        });
     }
 
     dispose() {
@@ -67,20 +116,38 @@ export class Ctx {
         this.commandDisposables.forEach((disposable) => disposable.dispose());
     }
 
-    clientFetcher() {
-        const self = this;
-        return {
-            get client(): lc.LanguageClient | undefined {
-                return self.client;
-            },
-        };
+    async onWorkspaceFolderChanges() {
+        const workspace = fetchWorkspace();
+        if (workspace.kind === "Detached Files" && this.workspace.kind === "Detached Files") {
+            if (workspace.files !== this.workspace.files) {
+                if (this.client?.isRunning()) {
+                    // Ideally we wouldn't need to tear down the server here, but currently detached files
+                    // are only specified at server start
+                    await this.stopAndDispose();
+                    await this.start();
+                }
+                return;
+            }
+        }
+        if (workspace.kind === "Workspace Folder" && this.workspace.kind === "Workspace Folder") {
+            return;
+        }
+        if (workspace.kind === "Empty") {
+            await this.stopAndDispose();
+            return;
+        }
+        if (this.client?.isRunning()) {
+            await this.restart();
+        }
     }
 
-    async getClient() {
+    private async getOrCreateClient() {
+        if (this.workspace.kind === "Empty") {
+            return;
+        }
+
         if (!this.traceOutputChannel) {
-            this.traceOutputChannel = vscode.window.createOutputChannel(
-                "Rust Analyzer Language Server Trace"
-            );
+            this.traceOutputChannel = new LazyOutputChannel("Rust Analyzer Language Server Trace");
             this.pushExtCleanup(this.traceOutputChannel);
         }
         if (!this.outputChannel) {
@@ -88,7 +155,7 @@ export class Ctx {
             this.pushExtCleanup(this.outputChannel);
         }
 
-        if (!this.client) {
+        if (!this._client) {
             this._serverPath = await bootstrap(this.extCtx, this.config, this.state).catch(
                 (err) => {
                     let message = "bootstrap error. ";
@@ -102,9 +169,7 @@ export class Ctx {
                     throw new Error(message);
                 }
             );
-            const newEnv = substituteVariablesInEnv(
-                Object.assign({}, process.env, this.config.serverExtraEnv)
-            );
+            const newEnv = Object.assign({}, process.env, this.config.serverExtraEnv);
             const run: lc.Executable = {
                 command: this._serverPath,
                 options: { env: newEnv },
@@ -123,49 +188,92 @@ export class Ctx {
                 };
             }
 
-            const initializationOptions = substituteVSCodeVariables(rawInitializationOptions);
+            const discoverProjectCommand = this.config.discoverProjectCommand;
+            if (discoverProjectCommand) {
+                const workspaces: JsonProject[] = await Promise.all(
+                    vscode.workspace.workspaceFolders!.map(async (folder): Promise<JsonProject> => {
+                        const rustDocuments = vscode.workspace.textDocuments.filter(isRustDocument);
+                        return discoverWorkspace(rustDocuments, discoverProjectCommand, {
+                            cwd: folder.uri.fsPath,
+                        });
+                    })
+                );
 
-            this.client = await createClient(
+                this.addToDiscoveredWorkspaces(workspaces);
+            }
+
+            const initializationOptions = prepareVSCodeConfig(
+                rawInitializationOptions,
+                (key, obj) => {
+                    // we only want to set discovered workspaces on the right key
+                    // and if a workspace has been discovered.
+                    if (key === "linkedProjects" && this.config.discoveredWorkspaces.length > 0) {
+                        obj["linkedProjects"] = this.config.discoveredWorkspaces;
+                    }
+                }
+            );
+
+            this._client = await createClient(
                 this.traceOutputChannel,
                 this.outputChannel,
                 initializationOptions,
-                serverOptions
+                serverOptions,
+                this.config
             );
             this.pushClientCleanup(
-                this.client.onNotification(ra.serverStatus, (params) =>
+                this._client.onNotification(ra.serverStatus, (params) =>
                     this.setServerStatus(params)
                 )
             );
+            this.pushClientCleanup(
+                this._client.onNotification(ra.openServerLogs, () => {
+                    this.outputChannel!.show();
+                })
+            );
         }
-        return this.client;
+        return this._client;
     }
 
-    async activate() {
-        log.info("Activating language client");
-        const client = await this.getClient();
+    async start() {
+        log.info("Starting language client");
+        const client = await this.getOrCreateClient();
+        if (!client) {
+            return;
+        }
         await client.start();
         this.updateCommands();
-        return client;
     }
 
-    async deactivate() {
-        log.info("Deactivating language client");
-        await this.client?.stop();
-        this.updateCommands();
+    async restart() {
+        // FIXME: We should re-use the client, that is ctx.deactivate() if none of the configs have changed
+        await this.stopAndDispose();
+        await this.start();
     }
 
     async stop() {
+        if (!this._client) {
+            return;
+        }
         log.info("Stopping language client");
+        this.updateCommands("disable");
+        await this._client.stop();
+    }
+
+    async stopAndDispose() {
+        if (!this._client) {
+            return;
+        }
+        log.info("Disposing language client");
+        this.updateCommands("disable");
         await this.disposeClient();
-        this.updateCommands();
     }
 
     private async disposeClient() {
         this.clientSubscriptions?.forEach((disposable) => disposable.dispose());
         this.clientSubscriptions = [];
-        await this.client?.dispose();
+        await this._client?.dispose();
         this._serverPath = undefined;
-        this.client = undefined;
+        this._client = undefined;
     }
 
     get activeRustEditor(): RustEditor | undefined {
@@ -185,56 +293,97 @@ export class Ctx {
         return this._serverPath;
     }
 
-    private updateCommands() {
+    addToDiscoveredWorkspaces(workspaces: JsonProject[]) {
+        for (const workspace of workspaces) {
+            const index = this.config.discoveredWorkspaces.indexOf(workspace);
+            if (~index) {
+                this.config.discoveredWorkspaces[index] = workspace;
+            } else {
+                this.config.discoveredWorkspaces.push(workspace);
+            }
+        }
+    }
+
+    private updateCommands(forceDisable?: "disable") {
         this.commandDisposables.forEach((disposable) => disposable.dispose());
         this.commandDisposables = [];
-        const fetchFactory = (factory: CommandFactory, fullName: string) => {
-            return this.client && this.client.isRunning()
-                ? factory.enabled
-                : factory.disabled ||
-                      ((_) => () =>
-                          vscode.window.showErrorMessage(
-                              `command ${fullName} failed: rust-analyzer server is not running`
-                          ));
+
+        const clientRunning = (!forceDisable && this._client?.isRunning()) ?? false;
+        const isClientRunning = function (_ctx: Ctx): _ctx is CtxInit {
+            return clientRunning;
         };
+
         for (const [name, factory] of Object.entries(this.commandFactories)) {
             const fullName = `rust-analyzer.${name}`;
-            const callback = fetchFactory(factory, fullName)(this);
+            let callback;
+            if (isClientRunning(this)) {
+                // we asserted that `client` is defined
+                callback = factory.enabled(this);
+            } else if (factory.disabled) {
+                callback = factory.disabled(this);
+            } else {
+                callback = () =>
+                    vscode.window.showErrorMessage(
+                        `command ${fullName} failed: rust-analyzer server is not running`
+                    );
+            }
+
             this.commandDisposables.push(vscode.commands.registerCommand(fullName, callback));
         }
     }
 
-    setServerStatus(status: ServerStatusParams) {
+    setServerStatus(status: ServerStatusParams | { health: "stopped" }) {
         let icon = "";
         const statusBar = this.statusBar;
+        statusBar.tooltip = new vscode.MarkdownString("", true);
+        statusBar.tooltip.isTrusted = true;
         switch (status.health) {
             case "ok":
-                statusBar.tooltip = status.message ?? "Ready";
-                statusBar.command = undefined;
+                statusBar.tooltip.appendText(status.message ?? "Ready");
                 statusBar.color = undefined;
                 statusBar.backgroundColor = undefined;
+                statusBar.command = "rust-analyzer.stopServer";
                 break;
             case "warning":
-                statusBar.tooltip =
-                    (status.message ? status.message + "\n" : "") + "Click to reload.";
-
-                statusBar.command = "rust-analyzer.reloadWorkspace";
+                if (status.message) {
+                    statusBar.tooltip.appendText(status.message);
+                }
                 statusBar.color = new vscode.ThemeColor("statusBarItem.warningForeground");
                 statusBar.backgroundColor = new vscode.ThemeColor(
                     "statusBarItem.warningBackground"
                 );
+                statusBar.command = "rust-analyzer.openLogs";
                 icon = "$(warning) ";
                 break;
             case "error":
-                statusBar.tooltip =
-                    (status.message ? status.message + "\n" : "") + "Click to reload.";
-
-                statusBar.command = "rust-analyzer.reloadWorkspace";
+                if (status.message) {
+                    statusBar.tooltip.appendText(status.message);
+                }
                 statusBar.color = new vscode.ThemeColor("statusBarItem.errorForeground");
                 statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+                statusBar.command = "rust-analyzer.openLogs";
                 icon = "$(error) ";
                 break;
+            case "stopped":
+                statusBar.tooltip.appendText("Server is stopped");
+                statusBar.tooltip.appendMarkdown(
+                    "\n\n[Start server](command:rust-analyzer.startServer)"
+                );
+                statusBar.color = undefined;
+                statusBar.backgroundColor = undefined;
+                statusBar.command = "rust-analyzer.startServer";
+                statusBar.text = `$(stop-circle) rust-analyzer`;
+                return;
         }
+        if (statusBar.tooltip.value) {
+            statusBar.tooltip.appendText("\n\n");
+        }
+        statusBar.tooltip.appendMarkdown(
+            "\n\n[Reload Workspace](command:rust-analyzer.reloadWorkspace)"
+        );
+        statusBar.tooltip.appendMarkdown("\n\n[Open logs](command:rust-analyzer.openLogs)");
+        statusBar.tooltip.appendMarkdown("\n\n[Restart server](command:rust-analyzer.startServer)");
+        statusBar.tooltip.appendMarkdown("[Stop server](command:rust-analyzer.stopServer)");
         if (!status.quiescent) icon = "$(sync~spin) ";
         statusBar.text = `${icon}rust-analyzer`;
     }

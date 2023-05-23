@@ -104,6 +104,33 @@ This modifier has no effect when building other targets like executables or dyna
 
 The default for this modifier is `+bundle`.
 
+### Linking modifiers: `verbatim`
+
+This modifier is compatible with all linking kinds.
+
+`+verbatim` means that rustc itself won't add any target-specified library prefixes or suffixes
+(like `lib` or `.a`) to the library name, and will try its best to ask for the same thing from the
+linker.
+
+For `ld`-like linkers supporting GNU extensions rustc will use the `-l:filename` syntax (note the
+colon) when passing the library, so the linker won't add any prefixes or suffixes to it.
+See [`-l namespec`](https://sourceware.org/binutils/docs/ld/Options.html) in ld documentation for
+more details. \
+For linkers not supporting any verbatim modifiers (e.g. `link.exe` or `ld64`) the library name will
+be passed as is. So the most reliable cross-platform use scenarios for this option are when no
+linker is involved, for example bundling native libraries into rlibs.
+
+`-verbatim` means that rustc will either add a target-specific prefix and suffix to the library
+name before passing it to linker, or won't prevent linker from implicitly adding it. \
+In case of `raw-dylib` kind in particular `.dll` will be added to the library name on Windows.
+
+The default for this modifier is `-verbatim`.
+
+NOTE: Even with `+verbatim` and `-l:filename` syntax `ld`-like linkers do not typically support
+passing absolute paths to libraries. Usually such paths need to be passed as input files without
+using any options like `-l`, e.g. `ld /my/absolute/path`. \
+`-Clink-arg=/my/absolute/path` can be used for doing this from stable `rustc`.
+
 <a id="option-crate-type"></a>
 ## `--crate-type`: a list of types of crates for the compiler to emit
 
@@ -221,8 +248,14 @@ The valid types of print values are:
   exact format of this debugging output is not a stable guarantee, other than
   that it will include the linker executable and the text of each command-line
   argument passed to the linker.
+- `deployment-target` - The currently selected [deployment target] (or minimum OS version)
+  for the selected Apple platform target. This value can be used or passed along to other
+  components alongside a Rust build that need this information, such as C compilers.
+  This returns rustc's minimum supported deployment target if no `*_DEPLOYMENT_TARGET` variable
+  is present in the environment, or otherwise returns the variable's parsed value.
 
 [conditional compilation]: ../reference/conditional-compilation.html
+[deployment target]: https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/cross_development/Configuring/configuring.html
 
 <a id="option-g-debug"></a>
 ## `-g`: include debug information
@@ -406,6 +439,9 @@ current directory out of pathnames emitted into the object files. The
 replacement is purely textual, with no consideration of the current system's
 pathname syntax. For example `--remap-path-prefix foo=bar` will match
 `foo/lib.rs` but not `./foo/lib.rs`.
+
+When multiple remappings are given and several of them match, the **last**
+matching one is applied.
 
 <a id="option-json"></a>
 ## `--json`: configure json messages printed by the compiler

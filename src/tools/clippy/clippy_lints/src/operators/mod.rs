@@ -90,39 +90,10 @@ declare_clippy_lint! {
     /// use rust_decimal::Decimal;
     /// let _n = Decimal::MAX + Decimal::MAX;
     /// ```
-    ///
-    /// ### Allowed types
-    /// Custom allowed types can be specified through the "arithmetic-side-effects-allowed" filter.
     #[clippy::version = "1.64.0"]
     pub ARITHMETIC_SIDE_EFFECTS,
     restriction,
     "any arithmetic expression that can cause side effects like overflows or panics"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for integer arithmetic operations which could overflow or panic.
-    ///
-    /// Specifically, checks for any operators (`+`, `-`, `*`, `<<`, etc) which are capable
-    /// of overflowing according to the [Rust
-    /// Reference](https://doc.rust-lang.org/reference/expressions/operator-expr.html#overflow),
-    /// or which can panic (`/`, `%`). No bounds analysis or sophisticated reasoning is
-    /// attempted.
-    ///
-    /// ### Why is this bad?
-    /// Integer overflow will trigger a panic in debug builds or will wrap in
-    /// release mode. Division by zero will cause a panic in either mode. In some applications one
-    /// wants explicitly checked, wrapping or saturating arithmetic.
-    ///
-    /// ### Example
-    /// ```rust
-    /// # let a = 0;
-    /// a + 1;
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub INTEGER_ARITHMETIC,
-    restriction,
-    "any integer arithmetic expression which could overflow or panic"
 }
 
 declare_clippy_lint! {
@@ -688,7 +659,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for uses of bitwise and/or operators between booleans, where performance may be improved by using
+    /// Checks for usage of bitwise and/or operators between booleans, where performance may be improved by using
     /// a lazy and.
     ///
     /// ### Why is this bad?
@@ -790,7 +761,6 @@ pub struct Operators {
 impl_lint_pass!(Operators => [
     ABSURD_EXTREME_COMPARISONS,
     ARITHMETIC_SIDE_EFFECTS,
-    INTEGER_ARITHMETIC,
     FLOAT_ARITHMETIC,
     ASSIGN_OP_PATTERN,
     MISREFACTORED_ASSIGN_OP,

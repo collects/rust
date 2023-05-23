@@ -1,10 +1,10 @@
-use std::convert::TryInto;
-
+use super::Const;
 use crate::mir;
 use crate::mir::interpret::{AllocId, ConstValue, Scalar};
+use crate::ty::abstract_const::CastKind;
 use crate::ty::subst::{InternalSubsts, SubstsRef};
 use crate::ty::ParamEnv;
-use crate::ty::{self, TyCtxt, TypeVisitable};
+use crate::ty::{self, List, Ty, TyCtxt, TypeVisitableExt};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
@@ -17,7 +17,7 @@ use super::ScalarInt;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable, Lift)]
 #[derive(Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct UnevaluatedConst<'tcx> {
-    pub def: ty::WithOptConstParam<DefId>,
+    pub def: DefId,
     pub substs: SubstsRef<'tcx>,
 }
 
@@ -36,17 +36,15 @@ impl<'tcx> UnevaluatedConst<'tcx> {
 
 impl<'tcx> UnevaluatedConst<'tcx> {
     #[inline]
-    pub fn new(
-        def: ty::WithOptConstParam<DefId>,
-        substs: SubstsRef<'tcx>,
-    ) -> UnevaluatedConst<'tcx> {
+    pub fn new(def: DefId, substs: SubstsRef<'tcx>) -> UnevaluatedConst<'tcx> {
         UnevaluatedConst { def, substs }
     }
 }
 
 /// Represents a constant in Rust.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable)]
 #[derive(Hash, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(derive_more::From)]
 pub enum ConstKind<'tcx> {
     /// A const generic parameter.
     Param(ty::ParamConst),
@@ -69,8 +67,30 @@ pub enum ConstKind<'tcx> {
 
     /// A placeholder for a const which could not be computed; this is
     /// propagated to avoid useless error messages.
-    Error(ty::DelaySpanBugEmitted),
+    #[from(ignore)]
+    Error(ErrorGuaranteed),
+
+    /// Expr which contains an expression which has partially evaluated items.
+    Expr(Expr<'tcx>),
 }
+
+impl<'tcx> From<ty::ConstVid<'tcx>> for ConstKind<'tcx> {
+    fn from(const_vid: ty::ConstVid<'tcx>) -> Self {
+        InferConst::Var(const_vid).into()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(HashStable, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable)]
+pub enum Expr<'tcx> {
+    Binop(mir::BinOp, Const<'tcx>, Const<'tcx>),
+    UnOp(mir::UnOp, Const<'tcx>),
+    FunctionCall(Const<'tcx>, &'tcx List<Const<'tcx>>),
+    Cast(CastKind, Const<'tcx>, Ty<'tcx>),
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+static_assert_size!(Expr<'_>, 24);
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 static_assert_size!(ConstKind<'_>, 32);
@@ -102,13 +122,13 @@ impl<'tcx> ConstKind<'tcx> {
     }
 
     #[inline]
-    pub fn try_to_machine_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_value()?.try_to_machine_usize(tcx)
+    pub fn try_to_target_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
+        self.try_to_value()?.try_to_target_usize(tcx)
     }
 }
 
 /// An inference variable for a const, for use in const generics.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable, Hash)]
 pub enum InferConst<'tcx> {
     /// Infer the value of the const.
     Var(ty::ConstVid<'tcx>),
@@ -194,23 +214,21 @@ impl<'tcx> ConstKind<'tcx> {
             // Note that we erase regions *before* calling `with_reveal_all_normalized`,
             // so that we don't try to invoke this query with
             // any region variables.
-            let param_env_and = tcx
-                .erase_regions(param_env)
-                .with_reveal_all_normalized(tcx)
-                .and(tcx.erase_regions(unevaluated));
 
             // HACK(eddyb) when the query key would contain inference variables,
             // attempt using identity substs and `ParamEnv` instead, that will succeed
             // when the expression doesn't depend on any parameters.
             // FIXME(eddyb, skinny121) pass `InferCtxt` into here when it's available, so that
             // we can call `infcx.const_eval_resolve` which handles inference variables.
-            let param_env_and = if param_env_and.needs_infer() {
-                tcx.param_env(unevaluated.def.did).and(ty::UnevaluatedConst {
+            let param_env_and = if (param_env, unevaluated).has_non_region_infer() {
+                tcx.param_env(unevaluated.def).and(ty::UnevaluatedConst {
                     def: unevaluated.def,
-                    substs: InternalSubsts::identity_for_item(tcx, unevaluated.def.did),
+                    substs: InternalSubsts::identity_for_item(tcx, unevaluated.def),
                 })
             } else {
-                param_env_and
+                tcx.erase_regions(param_env)
+                    .with_reveal_all_normalized(tcx)
+                    .and(tcx.erase_regions(unevaluated))
             };
 
             // FIXME(eddyb) maybe the `const_eval_*` methods should take
@@ -226,8 +244,8 @@ impl<'tcx> ConstKind<'tcx> {
                         // (which may be identity substs, see above),
                         // can leak through `val` into the const we return.
                         Ok(val) => Some(Ok(EvalResult::ValTree(val?))),
-                        Err(ErrorHandled::TooGeneric | ErrorHandled::Linted) => None,
-                        Err(ErrorHandled::Reported(e)) => Some(Err(e)),
+                        Err(ErrorHandled::TooGeneric) => None,
+                        Err(ErrorHandled::Reported(e)) => Some(Err(e.into())),
                     }
                 }
                 EvalMode::Mir => {
@@ -237,8 +255,8 @@ impl<'tcx> ConstKind<'tcx> {
                         // (which may be identity substs, see above),
                         // can leak through `val` into the const we return.
                         Ok(val) => Some(Ok(EvalResult::ConstVal(val))),
-                        Err(ErrorHandled::TooGeneric | ErrorHandled::Linted) => None,
-                        Err(ErrorHandled::Reported(e)) => Some(Err(e)),
+                        Err(ErrorHandled::TooGeneric) => None,
+                        Err(ErrorHandled::Reported(e)) => Some(Err(e.into())),
                     }
                 }
             }

@@ -137,6 +137,7 @@ impl FromStr for ArchiveKind {
             "bsd" => Ok(ArchiveKind::K_BSD),
             "darwin" => Ok(ArchiveKind::K_DARWIN),
             "coff" => Ok(ArchiveKind::K_COFF),
+            "aix_big" => Ok(ArchiveKind::K_AIXBIG),
             _ => Err(()),
         }
     }
@@ -182,6 +183,13 @@ impl AttributeKind {
     /// Create an LLVM Attribute with no associated value.
     pub fn create_attr(self, llcx: &Context) -> &Attribute {
         unsafe { LLVMRustCreateAttrNoValue(llcx, self) }
+    }
+}
+
+impl MemoryEffects {
+    /// Create an LLVM Attribute with these memory effects.
+    pub fn create_attr(self, llcx: &Context) -> &Attribute {
+        unsafe { LLVMRustCreateMemoryEffectsAttr(llcx, self) }
     }
 }
 

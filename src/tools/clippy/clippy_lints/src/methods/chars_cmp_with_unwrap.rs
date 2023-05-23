@@ -9,8 +9,8 @@ use rustc_lint::LateContext;
 use rustc_lint::Lint;
 
 /// Wrapper fn for `CHARS_NEXT_CMP` and `CHARS_LAST_CMP` lints with `unwrap()`.
-pub(super) fn check<'tcx>(
-    cx: &LateContext<'tcx>,
+pub(super) fn check(
+    cx: &LateContext<'_>,
     info: &crate::methods::BinaryExprInfo<'_>,
     chain_methods: &[&str],
     lint: &'static Lint,
@@ -18,7 +18,7 @@ pub(super) fn check<'tcx>(
 ) -> bool {
     if_chain! {
         if let Some(args) = method_chain_args(info.chain, chain_methods);
-        if let hir::ExprKind::Lit(ref lit) = info.other.kind;
+        if let hir::ExprKind::Lit(lit) = info.other.kind;
         if let ast::LitKind::Char(c) = lit.node;
         then {
             let mut applicability = Applicability::MachineApplicable;

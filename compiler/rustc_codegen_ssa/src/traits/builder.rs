@@ -14,6 +14,7 @@ use crate::mir::operand::OperandRef;
 use crate::mir::place::PlaceRef;
 use crate::MemFlags;
 
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::ty::layout::{HasParamEnv, TyAndLayout};
 use rustc_middle::ty::Ty;
 use rustc_span::Span;
@@ -72,6 +73,7 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn invoke(
         &mut self,
         llty: Self::Type,
+        fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],
@@ -151,11 +153,11 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     /// Called for Rvalue::Repeat when the elem is neither a ZST nor optimizable using memset.
     fn write_operand_repeatedly(
-        self,
+        &mut self,
         elem: OperandRef<'tcx, Self::Value>,
         count: u64,
         dest: PlaceRef<'tcx, Self::Value>,
-    ) -> Self;
+    );
 
     fn range_metadata(&mut self, load: Self::Value, range: WrappingRange);
     fn nonnull_metadata(&mut self, load: Self::Value);
@@ -271,8 +273,9 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn set_personality_fn(&mut self, personality: Self::Value);
 
     // These are used by everyone except msvc
-    fn cleanup_landing_pad(&mut self, ty: Self::Type, pers_fn: Self::Value) -> Self::Value;
-    fn resume(&mut self, exn: Self::Value);
+    fn cleanup_landing_pad(&mut self, pers_fn: Self::Value) -> (Self::Value, Self::Value);
+    fn filter_landing_pad(&mut self, pers_fn: Self::Value) -> (Self::Value, Self::Value);
+    fn resume(&mut self, exn0: Self::Value, exn1: Self::Value);
 
     // These are used only by msvc
     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
@@ -321,6 +324,7 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn call(
         &mut self,
         llty: Self::Type,
+        fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],

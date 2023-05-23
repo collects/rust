@@ -26,19 +26,19 @@ pub fn report_symbol_names(tcx: TyCtxt<'_>) {
         let crate_items = tcx.hir_crate_items(());
 
         for id in crate_items.items() {
-            symbol_names.process_attrs(id.def_id.def_id);
+            symbol_names.process_attrs(id.owner_id.def_id);
         }
 
         for id in crate_items.trait_items() {
-            symbol_names.process_attrs(id.def_id.def_id);
+            symbol_names.process_attrs(id.owner_id.def_id);
         }
 
         for id in crate_items.impl_items() {
-            symbol_names.process_attrs(id.def_id.def_id);
+            symbol_names.process_attrs(id.owner_id.def_id);
         }
 
         for id in crate_items.foreign_items() {
-            symbol_names.process_attrs(id.def_id.def_id);
+            symbol_names.process_attrs(id.owner_id.def_id);
         }
     })
 }
@@ -53,7 +53,7 @@ impl SymbolNamesTest<'_> {
         // The formatting of `tag({})` is chosen so that tests can elect
         // to test the entirety of the string, if they choose, or else just
         // some subset.
-        for attr in tcx.get_attrs(def_id.to_def_id(), SYMBOL_NAME) {
+        for attr in tcx.get_attrs(def_id, SYMBOL_NAME) {
             let def_id = def_id.to_def_id();
             let instance = Instance::new(
                 def_id,
@@ -74,16 +74,16 @@ impl SymbolNamesTest<'_> {
                 tcx.sess.emit_err(TestOutput {
                     span: attr.span,
                     kind: Kind::DemanglingAlt,
-                    content: format!("{:#}", demangling),
+                    content: format!("{demangling:#}"),
                 });
             }
         }
 
-        for attr in tcx.get_attrs(def_id.to_def_id(), DEF_PATH) {
+        for attr in tcx.get_attrs(def_id, DEF_PATH) {
             tcx.sess.emit_err(TestOutput {
                 span: attr.span,
                 kind: Kind::DefPath,
-                content: with_no_trimmed_paths!(tcx.def_path_str(def_id.to_def_id())),
+                content: with_no_trimmed_paths!(tcx.def_path_str(def_id)),
             });
         }
     }

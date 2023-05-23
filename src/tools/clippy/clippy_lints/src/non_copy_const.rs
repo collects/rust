@@ -1,4 +1,4 @@
-//! Checks for uses of const which the type is not `Freeze` (`Cell`-free).
+//! Checks for usage of const which the type is not `Freeze` (`Cell`-free).
 //!
 //! This lint is **warn** by default.
 
@@ -20,7 +20,7 @@ use rustc_middle::mir::interpret::{ConstValue, ErrorHandled};
 use rustc_middle::ty::adjustment::Adjust;
 use rustc_middle::ty::{self, Ty};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::{sym, InnerSpan, Span, DUMMY_SP};
+use rustc_span::{sym, InnerSpan, Span};
 
 // FIXME: this is a correctness problem but there's no suitable
 // warn-by-default category.
@@ -136,7 +136,7 @@ fn is_unfrozen<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
     // since it works when a pointer indirection involves (`Cell<*const T>`).
     // Making up a `ParamEnv` where every generic params and assoc types are `Freeze`is another option;
     // but I'm not sure whether it's a decent way, if possible.
-    cx.tcx.layout_of(cx.param_env.and(ty)).is_ok() && !ty.is_freeze(cx.tcx.at(DUMMY_SP), cx.param_env)
+    cx.tcx.layout_of(cx.param_env.and(ty)).is_ok() && !ty.is_freeze(cx.tcx, cx.param_env)
 }
 
 fn is_value_unfrozen_raw<'tcx>(
@@ -196,11 +196,9 @@ fn is_value_unfrozen_poly<'tcx>(cx: &LateContext<'tcx>, body_id: BodyId, ty: Ty<
 fn is_value_unfrozen_expr<'tcx>(cx: &LateContext<'tcx>, hir_id: HirId, def_id: DefId, ty: Ty<'tcx>) -> bool {
     let substs = cx.typeck_results().node_substs(hir_id);
 
-    let result = cx.tcx.const_eval_resolve(
-        cx.param_env,
-        mir::UnevaluatedConst::new(ty::WithOptConstParam::unknown(def_id), substs),
-        None,
-    );
+    let result = cx
+        .tcx
+        .const_eval_resolve(cx.param_env, mir::UnevaluatedConst::new(def_id, substs), None);
     is_value_unfrozen_raw(cx, result, ty)
 }
 
@@ -303,7 +301,7 @@ impl<'tcx> LateLintPass<'tcx> for NonCopyConst {
                         if let Some(of_trait_def_id) = of_trait_ref.trait_def_id();
                         if let Some(of_assoc_item) = cx
                             .tcx
-                            .associated_item(impl_item.def_id)
+                            .associated_item(impl_item.owner_id)
                             .trait_item_def_id;
                         if cx
                             .tcx
@@ -313,7 +311,7 @@ impl<'tcx> LateLintPass<'tcx> for NonCopyConst {
                                 // and, in that case, the definition is *not* generic.
                                 cx.tcx.normalize_erasing_regions(
                                     cx.tcx.param_env(of_trait_def_id),
-                                    cx.tcx.type_of(of_assoc_item),
+                                    cx.tcx.type_of(of_assoc_item).subst_identity(),
                                 ),
                             ))
                             .is_err();
@@ -366,7 +364,7 @@ impl<'tcx> LateLintPass<'tcx> for NonCopyConst {
             let mut dereferenced_expr = expr;
             let mut needs_check_adjustment = true;
             loop {
-                let parent_id = cx.tcx.hir().get_parent_node(cur_expr.hir_id);
+                let parent_id = cx.tcx.hir().parent_id(cur_expr.hir_id);
                 if parent_id == cur_expr.hir_id {
                     break;
                 }

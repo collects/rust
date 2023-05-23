@@ -161,14 +161,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // Querying system information
             "pthread_get_stackaddr_np" => {
                 let [thread] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.read_scalar(thread)?.to_machine_usize(this)?;
-                let stack_addr = Scalar::from_uint(STACK_ADDR, this.pointer_size());
+                this.read_target_usize(thread)?;
+                let stack_addr = Scalar::from_uint(this.machine.stack_addr, this.pointer_size());
                 this.write_scalar(stack_addr, dest)?;
             }
             "pthread_get_stacksize_np" => {
                 let [thread] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.read_scalar(thread)?.to_machine_usize(this)?;
-                let stack_size = Scalar::from_uint(STACK_SIZE, this.pointer_size());
+                this.read_target_usize(thread)?;
+                let stack_size = Scalar::from_uint(this.machine.stack_size, this.pointer_size());
                 this.write_scalar(stack_size, dest)?;
             }
 
@@ -176,12 +176,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "pthread_setname_np" => {
                 let [name] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let thread = this.pthread_self()?;
-                let max_len = this.eval_libc("MAXTHREADNAMESIZE")?.to_machine_usize(this)?;
-                this.pthread_setname_np(
+                let max_len = this.eval_libc("MAXTHREADNAMESIZE").to_target_usize(this)?;
+                let res = this.pthread_setname_np(
                     thread,
                     this.read_scalar(name)?,
                     max_len.try_into().unwrap(),
                 )?;
+                // Contrary to the manpage, `pthread_setname_np` on macOS still
+                // returns an integer indicating success.
+                this.write_scalar(res, dest)?;
             }
             "pthread_getname_np" => {
                 let [thread, name, len] =

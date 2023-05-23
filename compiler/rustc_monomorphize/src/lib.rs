@@ -1,5 +1,4 @@
 #![feature(array_windows)]
-#![feature(control_flow_enum)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
 #![deny(rustc::untranslatable_diagnostic)]
@@ -10,11 +9,13 @@ extern crate tracing;
 #[macro_use]
 extern crate rustc_middle;
 
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
 use rustc_hir::lang_items::LangItem;
+use rustc_middle::query::{Providers, TyCtxtAt};
 use rustc_middle::traits;
 use rustc_middle::ty::adjustment::CustomCoerceUnsized;
-use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty};
 
 mod collector;
 mod errors;
@@ -22,17 +23,19 @@ mod partitioning;
 mod polymorphize;
 mod util;
 
+fluent_messages! { "../messages.ftl" }
+
 fn custom_coerce_unsize_info<'tcx>(
-    tcx: TyCtxt<'tcx>,
+    tcx: TyCtxtAt<'tcx>,
     source_ty: Ty<'tcx>,
     target_ty: Ty<'tcx>,
 ) -> CustomCoerceUnsized {
-    let def_id = tcx.require_lang_item(LangItem::CoerceUnsized, None);
-
-    let trait_ref = ty::Binder::dummy(ty::TraitRef {
-        def_id,
-        substs: tcx.mk_substs_trait(source_ty, &[target_ty.into()]),
-    });
+    let trait_ref = ty::Binder::dummy(ty::TraitRef::from_lang_item(
+        tcx.tcx,
+        LangItem::CoerceUnsized,
+        tcx.span,
+        [source_ty, target_ty],
+    ));
 
     match tcx.codegen_select_candidate((ty::ParamEnv::reveal_all(), trait_ref)) {
         Ok(traits::ImplSource::UserDefined(traits::ImplSourceUserDefinedData {

@@ -1,4 +1,5 @@
-//@ignore-target-windows: Concurrency on Windows is not supported yet.
+//@revisions: stack tree
+//@[tree]compile-flags: -Zmiri-tree-borrows
 //@compile-flags: -Zmiri-disable-isolation -Zmiri-strict-provenance
 
 use std::sync::{Arc, Barrier, Condvar, Mutex, Once, RwLock};
@@ -200,8 +201,10 @@ fn park_timeout() {
     thread::park_timeout(Duration::from_millis(200));
     // Normally, waiting in park/park_timeout may spuriously wake up early, but we
     // know Miri's timed synchronization primitives do not do that.
-
-    assert!((200..1000).contains(&start.elapsed().as_millis()));
+    // We allow much longer sleeps as well since the macOS GHA runners seem very oversubscribed
+    // and sometimes just pause for 1 second or more.
+    let elapsed = start.elapsed();
+    assert!((200..2000).contains(&elapsed.as_millis()), "bad sleep time: {elapsed:?}");
 }
 
 fn park_unpark() {
@@ -218,21 +221,23 @@ fn park_unpark() {
     thread::park();
     // Normally, waiting in park/park_timeout may spuriously wake up early, but we
     // know Miri's timed synchronization primitives do not do that.
-
-    assert!((200..1000).contains(&start.elapsed().as_millis()));
+    // We allow much longer sleeps as well since the macOS GHA runners seem very oversubscribed
+    // and sometimes just pause for 1 second or more.
+    let elapsed = start.elapsed();
+    assert!((200..2000).contains(&elapsed.as_millis()), "bad sleep time: {elapsed:?}");
 
     t2.join().unwrap();
 }
 
 fn main() {
-    check_barriers();
-    check_conditional_variables_notify_one();
-    check_conditional_variables_timed_wait_timeout();
-    check_conditional_variables_timed_wait_notimeout();
     check_mutex();
     check_rwlock_write();
     check_rwlock_read_no_deadlock();
     check_once();
     park_timeout();
     park_unpark();
+    check_barriers();
+    check_conditional_variables_notify_one();
+    check_conditional_variables_timed_wait_timeout();
+    check_conditional_variables_timed_wait_notimeout();
 }

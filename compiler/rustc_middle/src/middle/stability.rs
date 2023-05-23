@@ -3,7 +3,7 @@
 
 pub use self::StabilityLevel::*;
 
-use crate::ty::{self, DefIdTree, TyCtxt};
+use crate::ty::{self, TyCtxt};
 use rustc_ast::NodeId;
 use rustc_attr::{self as attr, ConstStability, DefaultBodyStability, Deprecation, Stability};
 use rustc_data_structures::fx::FxHashMap;
@@ -115,8 +115,8 @@ pub fn report_unstable(
         soft_handler(SOFT_UNSTABLE, span, &msg)
     } else {
         let mut err =
-            feature_err_issue(&sess.parse_sess, feature, span, GateIssue::Library(issue), &msg);
-        if let Some((inner_types, ref msg, sugg, applicability)) = suggestion {
+            feature_err_issue(&sess.parse_sess, feature, span, GateIssue::Library(issue), msg);
+        if let Some((inner_types, msg, sugg, applicability)) = suggestion {
             err.span_suggestion(inner_types, msg, sugg, applicability);
         }
         err.emit();
@@ -170,7 +170,7 @@ pub fn deprecation_suggestion(
     if let Some(suggestion) = suggestion {
         diag.span_suggestion_verbose(
             span,
-            &format!("replace the use of the deprecated {}", kind),
+            format!("replace the use of the deprecated {}", kind),
             suggestion,
             Applicability::MachineApplicable,
         );
@@ -223,8 +223,8 @@ pub fn deprecation_message_and_lint(
     )
 }
 
-pub fn early_report_deprecation<'a>(
-    lint_buffer: &'a mut LintBuffer,
+pub fn early_report_deprecation(
+    lint_buffer: &mut LintBuffer,
     message: &str,
     suggestion: Option<Symbol>,
     lint: &'static Lint,
@@ -255,7 +255,7 @@ fn late_report_deprecation(
     let method_span = method_span.unwrap_or(span);
     tcx.struct_span_lint_hir(lint, hir_id, method_span, message, |diag| {
         if let hir::Node::Expr(_) = tcx.hir().get(hir_id) {
-            let kind = tcx.def_kind(def_id).descr(def_id);
+            let kind = tcx.def_descr(def_id);
             deprecation_suggestion(diag, kind, suggestion, method_span);
         }
         diag
@@ -392,7 +392,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     let lint = deprecation_lint(is_in_effect);
                     if self.lint_level_at_node(lint, id).0 != Level::Allow {
                         let def_path = with_no_trimmed_paths!(self.def_path_str(def_id));
-                        let def_kind = self.def_kind(def_id).descr(def_id);
+                        let def_kind = self.def_descr(def_id);
 
                         late_report_deprecation(
                             self,
@@ -599,7 +599,7 @@ impl<'tcx> TyCtxt<'tcx> {
             |span, def_id| {
                 // The API could be uncallable for other reasons, for example when a private module
                 // was referenced.
-                self.sess.delay_span_bug(span, &format!("encountered unmarked API: {:?}", def_id));
+                self.sess.delay_span_bug(span, format!("encountered unmarked API: {:?}", def_id));
             },
         )
     }

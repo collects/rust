@@ -143,7 +143,7 @@ macro_rules! assert {
 
 fn main() {
      {
-        if !true {
+        if !(true ) {
             $crate::panic!("{} {:?}", arg1(a, b, c), arg2);
         }
     };
@@ -163,7 +163,8 @@ macro_rules! compile_error {
 }
 
 // This expands to nothing (since it's in item position), but emits an error.
-compile_error!("error!");
+compile_error!("error, with an escaped quote: \"");
+compile_error!(r"this is a raw string");
 "#,
         expect![[r##"
 #[rustc_builtin_macro]
@@ -172,7 +173,8 @@ macro_rules! compile_error {
     ($msg:expr,) => ({ /* compiler built-in */ })
 }
 
-/* error: error! */
+/* error: error, with an escaped quote: " */
+/* error: this is a raw string */
 "##]],
     );
 }
@@ -199,7 +201,7 @@ macro_rules! format_args {
 }
 
 fn main() {
-    $crate::fmt::Arguments::new_v1(&[], &[$crate::fmt::ArgumentV1::new(&(arg1(a, b, c)), $crate::fmt::Display::fmt), $crate::fmt::ArgumentV1::new(&(arg2), $crate::fmt::Display::fmt), ]);
+    $crate::fmt::Arguments::new_v1(&[], &[$crate::fmt::Argument::new(&(arg1(a, b, c)), $crate::fmt::Display::fmt), $crate::fmt::Argument::new(&(arg2), $crate::fmt::Display::fmt), ]);
 }
 "#]],
     );
@@ -227,7 +229,7 @@ macro_rules! format_args {
 }
 
 fn main() {
-    $crate::fmt::Arguments::new_v1(&[], &[$crate::fmt::ArgumentV1::new(&(a::<A, B>()), $crate::fmt::Display::fmt), $crate::fmt::ArgumentV1::new(&(b), $crate::fmt::Display::fmt), ]);
+    $crate::fmt::Arguments::new_v1(&[], &[$crate::fmt::Argument::new(&(a::<A, B>()), $crate::fmt::Display::fmt), $crate::fmt::Argument::new(&(b), $crate::fmt::Display::fmt), ]);
 }
 "#]],
     );
@@ -258,7 +260,7 @@ macro_rules! format_args {
 fn main() {
     let _ =
         /* parse error: expected field name or number */
-$crate::fmt::Arguments::new_v1(&[], &[$crate::fmt::ArgumentV1::new(&(a.), $crate::fmt::Display::fmt), ]);
+$crate::fmt::Arguments::new_v1(&[], &[$crate::fmt::Argument::new(&(a.), $crate::fmt::Display::fmt), ]);
 }
 "#]],
     );

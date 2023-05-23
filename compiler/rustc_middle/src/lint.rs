@@ -182,7 +182,7 @@ impl TyCtxt<'_> {
             if hir.attrs(id).iter().any(|attr| Level::from_attr(attr).is_some()) {
                 return id;
             }
-            let next = hir.get_parent_node(id);
+            let next = hir.parent_id(id);
             if next == id {
                 bug!("lint traversal reached the root of the crate");
             }
@@ -231,28 +231,19 @@ pub fn explain_lint_level_source(
     let name = lint.name_lower();
     match src {
         LintLevelSource::Default => {
-            err.note_once(&format!("`#[{}({})]` on by default", level.as_str(), name));
+            err.note_once(format!("`#[{}({})]` on by default", level.as_str(), name));
         }
         LintLevelSource::CommandLine(lint_flag_val, orig_level) => {
-            let flag = match orig_level {
-                Level::Warn => "-W",
-                Level::Deny => "-D",
-                Level::Forbid => "-F",
-                Level::Allow => "-A",
-                Level::ForceWarn(_) => "--force-warn",
-                Level::Expect(_) => {
-                    unreachable!("the expect level does not have a commandline flag")
-                }
-            };
+            let flag = orig_level.to_cmd_flag();
             let hyphen_case_lint_name = name.replace('_', "-");
             if lint_flag_val.as_str() == name {
-                err.note_once(&format!(
+                err.note_once(format!(
                     "requested on the command line with `{} {}`",
                     flag, hyphen_case_lint_name
                 ));
             } else {
                 let hyphen_case_flag_val = lint_flag_val.as_str().replace('_', "-");
-                err.note_once(&format!(
+                err.note_once(format!(
                     "`{} {}` implied by `{} {}`",
                     flag, hyphen_case_lint_name, flag, hyphen_case_flag_val
                 ));
@@ -265,7 +256,7 @@ pub fn explain_lint_level_source(
             err.span_note_once(span, "the lint level is defined here");
             if lint_attr_name.as_str() != name {
                 let level_str = level.as_str();
-                err.note_once(&format!(
+                err.note_once(format!(
                     "`#[{}({})]` implied by `#[{}({})]`",
                     level_str, name, level_str, lint_attr_name
                 ));
@@ -276,7 +267,7 @@ pub fn explain_lint_level_source(
 
 /// The innermost function for emitting lints.
 ///
-/// If you are loocking to implement a lint, look for higher level functions,
+/// If you are looking to implement a lint, look for higher level functions,
 /// for example:
 /// - [`TyCtxt::emit_spanned_lint`]
 /// - [`TyCtxt::struct_span_lint_hir`]
@@ -453,12 +444,12 @@ pub fn struct_lint_level(
             };
 
             if future_incompatible.explain_reason {
-                err.warn(&explanation);
+                err.warn(explanation);
             }
             if !future_incompatible.reference.is_empty() {
                 let citation =
                     format!("for more information, see {}", future_incompatible.reference);
-                err.note(&citation);
+                err.note(citation);
             }
         }
 

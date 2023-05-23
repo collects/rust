@@ -56,7 +56,7 @@
 //!     let value_any = value as &dyn Any;
 //!
 //!     // Try to convert our value to a `String`. If successful, we want to
-//!     // output the String`'s length as well as its value. If not, it's a
+//!     // output the `String`'s length as well as its value. If not, it's a
 //!     // different type: just print it out unadorned.
 //!     match value_any.downcast_ref::<String>() {
 //!         Some(as_string) => {
@@ -148,7 +148,7 @@
 //! ```
 //!
 //! In this example, if the concrete type of `obj` in `use_my_trait` is `SomeConcreteType`, then
-//! the `get_context_ref` call will return a reference to `obj.some_string` with type `&String`.
+//! the `get_context_by_ref` call will return a reference to `obj.some_string` with type `&String`.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -662,7 +662,7 @@ impl dyn Any + Send + Sync {
 /// While `TypeId` implements `Hash`, `PartialOrd`, and `Ord`, it is worth
 /// noting that the hashes and ordering will vary between Rust releases. Beware
 /// of relying on them inside of your code!
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct TypeId {
     t: u64,
@@ -866,7 +866,7 @@ where
 ///
 /// A data provider provides values by calling this type's provide methods.
 #[unstable(feature = "provide_any", issue = "96024")]
-#[repr(transparent)]
+#[cfg_attr(not(doc), repr(transparent))] // work around https://github.com/rust-lang/rust/issues/90435
 pub struct Demand<'a>(dyn Erased<'a> + 'a);
 
 impl<'a> Demand<'a> {

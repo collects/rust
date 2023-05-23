@@ -22,17 +22,20 @@ use log::debug;
 
 use rustc_data_structures::sync::Lrc;
 use rustc_driver::Compilation;
-use rustc_hir::{self as hir, def_id::LOCAL_CRATE, Node};
+use rustc_hir::{self as hir, Node};
 use rustc_interface::interface::Config;
 use rustc_middle::{
     middle::exported_symbols::{
         ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
     },
-    ty::{query::ExternProviders, TyCtxt},
+    query::{ExternProviders, LocalCrate},
+    ty::TyCtxt,
 };
+use rustc_session::config::OptLevel;
+
 use rustc_session::{config::CrateType, search_paths::PathKind, CtfeBacktrace};
 
-use miri::{BacktraceStyle, ProvenanceMode, RetagFields};
+use miri::{BacktraceStyle, BorrowTrackerMethod, ProvenanceMode, RetagFields};
 
 struct MiriCompilerCalls {
     miri_config: miri::MiriConfig,
@@ -56,12 +59,14 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
 
     fn after_analysis<'tcx>(
         &mut self,
-        compiler: &rustc_interface::interface::Compiler,
+        _: &rustc_interface::interface::Compiler,
         queries: &'tcx rustc_interface::Queries<'tcx>,
     ) -> Compilation {
-        compiler.session().abort_if_errors();
+        queries.global_ctxt().unwrap().enter(|tcx| {
+            if tcx.sess.compile_status().is_err() {
+                tcx.sess.fatal("miri cannot be run on programs that fail compilation");
+            }
 
-        queries.global_ctxt().unwrap().peek_mut().enter(|tcx| {
             init_late_loggers(tcx);
             if !tcx.sess.crate_types().contains(&CrateType::Executable) {
                 tcx.sess.fatal("miri only makes sense on bin crates");
@@ -75,11 +80,26 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
             let mut config = self.miri_config.clone();
 
             // Add filename to `miri` arguments.
-            config.args.insert(0, compiler.input().filestem().to_string());
+            config.args.insert(0, tcx.sess.io.input.filestem().to_string());
 
             // Adjust working directory for interpretation.
             if let Some(cwd) = env::var_os("MIRI_CWD") {
                 env::set_current_dir(cwd).unwrap();
+            }
+
+            if tcx.sess.opts.optimize != OptLevel::No {
+                tcx.sess.warn("Miri does not support optimizations. If you have enabled optimizations \
+                    by selecting a Cargo profile (such as --release) which changes other profile settings \
+                    such as whether debug assertions and overflow checks are enabled, those settings are \
+                    still applied.");
+            }
+            if tcx.sess.mir_opt_level() > 0 {
+                tcx.sess.warn("You have explicitly enabled MIR optimizations, overriding Miri's default \
+                    which is to completely disable them. Any optimizations may hide UB that Miri would \
+                    otherwise detect, and it is not necessarily possible to predict what kind of UB will \
+                    be missed. If you are enabling optimizations to make Miri run faster, we advise using \
+                    cfg(miri) to shrink your workload instead. The performance benefit of enabling MIR \
+                    optimizations is usually marginal at best.");
             }
 
             if let Some(return_code) = miri::eval_entry(tcx, entry_def_id, entry_type, config) {
@@ -87,9 +107,8 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                     i32::try_from(return_code).expect("Return value was too large!"),
                 );
             }
+            tcx.sess.abort_if_errors();
         });
-
-        compiler.session().abort_if_errors();
 
         Compilation::Stop
     }
@@ -103,18 +122,20 @@ impl rustc_driver::Callbacks for MiriBeRustCompilerCalls {
     #[allow(rustc::potential_query_instability)] // rustc_codegen_ssa (where this code is copied from) also allows this lint
     fn config(&mut self, config: &mut Config) {
         if config.opts.prints.is_empty() && self.target_crate {
-            // Queries overriden here affect the data stored in `rmeta` files of dependencies,
+            // Queries overridden here affect the data stored in `rmeta` files of dependencies,
             // which will be used later in non-`MIRI_BE_RUSTC` mode.
             config.override_queries = Some(|_, local_providers, _| {
                 // `exported_symbols` and `reachable_non_generics` provided by rustc always returns
                 // an empty result if `tcx.sess.opts.output_types.should_codegen()` is false.
-                local_providers.exported_symbols = |tcx, cnum| {
-                    assert_eq!(cnum, LOCAL_CRATE);
+                local_providers.exported_symbols = |tcx, LocalCrate| {
+                    let reachable_set = tcx.with_stable_hashing_context(|hcx| {
+                        tcx.reachable_set(()).to_sorted(&hcx, true)
+                    });
                     tcx.arena.alloc_from_iter(
                         // This is based on:
                         // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L62-L63
                         // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L174
-                        tcx.reachable_set(()).iter().filter_map(|&local_def_id| {
+                        reachable_set.into_iter().filter_map(|&local_def_id| {
                             // Do the same filtering that rustc does:
                             // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L84-L102
                             // Otherwise it may cause unexpected behaviours and ICEs
@@ -192,10 +213,7 @@ fn init_late_loggers(tcx: TyCtxt<'_>) {
             if log::Level::from_str(&var).is_ok() {
                 env::set_var(
                     "RUSTC_LOG",
-                    format!(
-                        "rustc_middle::mir::interpret={0},rustc_const_eval::interpret={0}",
-                        var
-                    ),
+                    format!("rustc_middle::mir::interpret={var},rustc_const_eval::interpret={var}"),
                 );
             } else {
                 env::set_var("RUSTC_LOG", &var);
@@ -216,76 +234,28 @@ fn init_late_loggers(tcx: TyCtxt<'_>) {
     }
 }
 
-/// Returns the "default sysroot" that Miri will use for host things if no `--sysroot` flag is set.
-/// Should be a compile-time constant.
-fn host_sysroot() -> Option<String> {
-    if option_env!("RUSTC_STAGE").is_some() {
-        // This is being built as part of rustc, and gets shipped with rustup.
-        // We can rely on the sysroot computation in librustc_session.
-        return None;
-    }
-    // For builds outside rustc, we need to ensure that we got a sysroot
-    // that gets used as a default.  The sysroot computation in librustc_session would
-    // end up somewhere in the build dir (see `get_or_default_sysroot`).
-    // Taken from PR <https://github.com/Manishearth/rust-clippy/pull/911>.
-    let home = option_env!("RUSTUP_HOME").or(option_env!("MULTIRUST_HOME"));
-    let toolchain = option_env!("RUSTUP_TOOLCHAIN").or(option_env!("MULTIRUST_TOOLCHAIN"));
-    Some(match (home, toolchain) {
-        (Some(home), Some(toolchain)) => {
-            // Check that at runtime, we are still in this toolchain (if there is any toolchain).
-            if let Some(toolchain_runtime) =
-                env::var_os("RUSTUP_TOOLCHAIN").or_else(|| env::var_os("MULTIRUST_TOOLCHAIN"))
-            {
-                if toolchain_runtime != toolchain {
-                    show_error!(
-                        "This Miri got built with local toolchain `{toolchain}`, but now is being run under a different toolchain. \n\
-                        Make sure to run Miri in the toolchain it got built with, e.g. via `cargo +{toolchain} miri`."
-                    )
-                }
-            }
-            format!("{home}/toolchains/{toolchain}")
-        }
-        _ => option_env!("RUST_SYSROOT")
-            .unwrap_or_else(|| {
-                show_error!(
-                    "To build Miri without rustup, set the `RUST_SYSROOT` env var at build time",
-                )
-            })
-            .to_owned(),
-    })
-}
-
 /// Execute a compiler with the given CLI arguments and callbacks.
 fn run_compiler(
     mut args: Vec<String>,
     target_crate: bool,
     callbacks: &mut (dyn rustc_driver::Callbacks + Send),
 ) -> ! {
-    // Make sure we use the right default sysroot. The default sysroot is wrong,
-    // because `get_or_default_sysroot` in `librustc_session` bases that on `current_exe`.
-    //
-    // Make sure we always call `host_sysroot` as that also does some sanity-checks
-    // of the environment we were built in and whether it matches what we are running in.
-    let host_default_sysroot = host_sysroot();
-    // Now see if we even need to set something.
-    let sysroot_flag = "--sysroot";
-    if !args.iter().any(|e| e == sysroot_flag) {
-        // No sysroot was set, let's see if we have a custom default we want to configure.
-        let default_sysroot = if target_crate {
+    if target_crate {
+        // Miri needs a custom sysroot for target crates.
+        // If no `--sysroot` is given, the `MIRI_SYSROOT` env var is consulted to find where
+        // that sysroot lives, and that is passed to rustc.
+        let sysroot_flag = "--sysroot";
+        if !args.iter().any(|e| e == sysroot_flag) {
             // Using the built-in default here would be plain wrong, so we *require*
             // the env var to make sure things make sense.
-            Some(env::var("MIRI_SYSROOT").unwrap_or_else(|_| {
+            let miri_sysroot = env::var("MIRI_SYSROOT").unwrap_or_else(|_| {
                 show_error!(
                     "Miri was invoked in 'target' mode without `MIRI_SYSROOT` or `--sysroot` being set"
-                )
-            }))
-        } else {
-            host_default_sysroot
-        };
-        if let Some(sysroot) = default_sysroot {
-            // We need to overwrite the default that librustc_session would compute.
+                    )
+            });
+
             args.push(sysroot_flag.to_owned());
-            args.push(sysroot);
+            args.push(miri_sysroot);
         }
     }
 
@@ -318,11 +288,10 @@ fn main() {
     // (`install_ice_hook` might change `RUST_BACKTRACE`.)
     let env_snapshot = env::vars_os().collect::<Vec<_>>();
 
-    // Earliest rustc setup.
-    rustc_driver::install_ice_hook();
-
     // If the environment asks us to actually be rustc, then do that.
     if let Some(crate_kind) = env::var_os("MIRI_BE_RUSTC") {
+        // Earliest rustc setup.
+        rustc_driver::install_ice_hook(rustc_driver::DEFAULT_BUG_REPORT_URL, |_| ());
         rustc_driver::init_rustc_env_logger();
 
         let target_crate = if crate_kind == "target" {
@@ -340,6 +309,9 @@ fn main() {
             &mut MiriBeRustCompilerCalls { target_crate },
         )
     }
+
+    // Add an ICE bug report hook.
+    rustc_driver::install_ice_hook("https://github.com/rust-lang/miri/issues/new", |_| ());
 
     // Init loggers the Miri way.
     init_early_loggers();
@@ -365,7 +337,9 @@ fn main() {
         } else if arg == "-Zmiri-disable-validation" {
             miri_config.validate = false;
         } else if arg == "-Zmiri-disable-stacked-borrows" {
-            miri_config.stacked_borrows = false;
+            miri_config.borrow_tracker = None;
+        } else if arg == "-Zmiri-tree-borrows" {
+            miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows);
         } else if arg == "-Zmiri-disable-data-race-detector" {
             miri_config.data_race_detector = false;
             miri_config.weak_memory_emulation = false;
@@ -389,6 +363,8 @@ fn main() {
                 isolation_enabled = Some(false);
             }
             miri_config.isolated_op = miri::IsolatedOp::Allow;
+        } else if arg == "-Zmiri-disable-leak-backtraces" {
+            miri_config.collect_leak_backtraces = false;
         } else if arg == "-Zmiri-disable-weak-memory-emulation" {
             miri_config.weak_memory_emulation = false;
         } else if arg == "-Zmiri-track-weak-memory-loads" {
@@ -415,6 +391,7 @@ fn main() {
             };
         } else if arg == "-Zmiri-ignore-leaks" {
             miri_config.ignore_leaks = true;
+            miri_config.collect_leak_backtraces = false;
         } else if arg == "-Zmiri-panic-on-unsupported" {
             miri_config.panic_on_unsupported = true;
         } else if arg == "-Zmiri-tag-raw-pointers" {
@@ -442,10 +419,9 @@ fn main() {
             if miri_config.seed.is_some() {
                 show_error!("Cannot specify -Zmiri-seed multiple times!");
             }
-            let seed = u64::from_str_radix(param, 16)
-                        .unwrap_or_else(|_| show_error!(
-                            "-Zmiri-seed should only contain valid hex digits [0-9a-fA-F] and must fit into a u64 (max 16 characters)"
-                        ));
+            let seed = param.parse::<u64>().unwrap_or_else(|_| {
+                show_error!("-Zmiri-seed must be an integer that fits into u64")
+            });
             miri_config.seed = Some(seed);
         } else if let Some(_param) = arg.strip_prefix("-Zmiri-env-exclude=") {
             show_error!(
@@ -462,7 +438,7 @@ fn main() {
                         err
                     ),
             };
-            for id in ids.into_iter().map(miri::SbTag::new) {
+            for id in ids.into_iter().map(miri::BorTag::new) {
                 if let Some(id) = id {
                     miri_config.tracked_pointer_tags.insert(id);
                 } else {
@@ -564,6 +540,18 @@ fn main() {
             };
 
             miri_config.num_cpus = num_cpus;
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-force-page-size=") {
+            let page_size = match param.parse::<u64>() {
+                Ok(i) =>
+                    if i.is_power_of_two() {
+                        i * 1024
+                    } else {
+                        show_error!("-Zmiri-force-page-size requires a power of 2: {}", i)
+                    },
+                Err(err) => show_error!("-Zmiri-force-page-size requires a `u64`: {}", err),
+            };
+
+            miri_config.page_size = Some(page_size);
         } else {
             // Forward to rustc.
             rustc_args.push(arg);

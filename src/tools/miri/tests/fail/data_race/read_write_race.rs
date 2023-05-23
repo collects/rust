@@ -1,5 +1,5 @@
-// We want to control preemption here.
-//@compile-flags: -Zmiri-preemption-rate=0
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
 
 use std::thread::spawn;
 
@@ -15,11 +15,13 @@ pub fn main() {
     let c = EvilSend(b);
     unsafe {
         let j1 = spawn(move || {
+            let c = c; // avoid field capturing
             let _val = *c.0;
         });
 
         let j2 = spawn(move || {
-            *c.0 = 64; //~ ERROR: Data race detected between Write on thread `<unnamed>` and Read on thread `<unnamed>`
+            let c = c; // avoid field capturing
+            *c.0 = 64; //~ ERROR: Data race detected between (1) Read on thread `<unnamed>` and (2) Write on thread `<unnamed>`
         });
 
         j1.join().unwrap();

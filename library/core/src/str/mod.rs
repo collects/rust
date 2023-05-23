@@ -16,6 +16,7 @@ mod validations;
 use self::pattern::Pattern;
 use self::pattern::{DoubleEndedSearcher, ReverseSearcher, Searcher};
 
+use crate::ascii;
 use crate::char::{self, EscapeDebugExtArgs};
 use crate::mem;
 use crate::slice::{self, SliceIndex};
@@ -206,9 +207,8 @@ impl str {
     /// ```
     #[must_use]
     #[stable(feature = "is_char_boundary", since = "1.9.0")]
-    #[rustc_const_unstable(feature = "const_is_char_boundary", issue = "none")]
     #[inline]
-    pub const fn is_char_boundary(&self, index: usize) -> bool {
+    pub fn is_char_boundary(&self, index: usize) -> bool {
         // 0 is always ok.
         // Test for 0 explicitly so that it can optimize out the check
         // easily and skip reading string data for that case.
@@ -368,7 +368,7 @@ impl str {
     #[inline(always)]
     pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: the cast from `&str` to `&[u8]` is safe since `str`
-        // has the same layout as `&[u8]` (only libstd can make this guarantee).
+        // has the same layout as `&[u8]` (only std can make this guarantee).
         // The pointer dereference is safe since it comes from a mutable reference which
         // is guaranteed to be valid for writes.
         unsafe { &mut *(self as *mut str as *mut [u8]) }
@@ -396,7 +396,7 @@ impl str {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "rustc_str_as_ptr", since = "1.32.0")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn as_ptr(&self) -> *const u8 {
         self as *const str as *const u8
     }
@@ -411,7 +411,7 @@ impl str {
     /// modified in a way that it remains valid UTF-8.
     #[stable(feature = "str_as_mut_ptr", since = "1.36.0")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut str as *mut u8
     }
@@ -436,9 +436,8 @@ impl str {
     /// assert!(v.get(..42).is_none());
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const fn get<I: ~const SliceIndex<str>>(&self, i: I) -> Option<&I::Output> {
+    pub fn get<I: SliceIndex<str>>(&self, i: I) -> Option<&I::Output> {
         i.get(self)
     }
 
@@ -469,9 +468,8 @@ impl str {
     /// assert_eq!("HEllo", v);
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const fn get_mut<I: ~const SliceIndex<str>>(&mut self, i: I) -> Option<&mut I::Output> {
+    pub fn get_mut<I: SliceIndex<str>>(&mut self, i: I) -> Option<&mut I::Output> {
         i.get_mut(self)
     }
 
@@ -502,9 +500,8 @@ impl str {
     /// }
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const unsafe fn get_unchecked<I: ~const SliceIndex<str>>(&self, i: I) -> &I::Output {
+    pub unsafe fn get_unchecked<I: SliceIndex<str>>(&self, i: I) -> &I::Output {
         // SAFETY: the caller must uphold the safety contract for `get_unchecked`;
         // the slice is dereferenceable because `self` is a safe reference.
         // The returned pointer is safe because impls of `SliceIndex` have to guarantee that it is.
@@ -538,12 +535,8 @@ impl str {
     /// }
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const unsafe fn get_unchecked_mut<I: ~const SliceIndex<str>>(
-        &mut self,
-        i: I,
-    ) -> &mut I::Output {
+    pub unsafe fn get_unchecked_mut<I: SliceIndex<str>>(&mut self, i: I) -> &mut I::Output {
         // SAFETY: the caller must uphold the safety contract for `get_unchecked_mut`;
         // the slice is dereferenceable because `self` is a safe reference.
         // The returned pointer is safe because impls of `SliceIndex` have to guarantee that it is.
@@ -902,6 +895,12 @@ impl str {
     ///
     /// assert_eq!(None, iter.next());
     /// ```
+    ///
+    /// If the string is empty or all whitespace, the iterator yields no string slices:
+    /// ```
+    /// assert_eq!("".split_whitespace().next(), None);
+    /// assert_eq!("   ".split_whitespace().next(), None);
+    /// ```
     #[must_use = "this returns the split string as an iterator, \
                   without modifying the original"]
     #[stable(feature = "split_whitespace", since = "1.1.0")]
@@ -946,6 +945,12 @@ impl str {
     ///
     /// assert_eq!(None, iter.next());
     /// ```
+    ///
+    /// If the string is empty or all ASCII whitespace, the iterator yields no string slices:
+    /// ```
+    /// assert_eq!("".split_ascii_whitespace().next(), None);
+    /// assert_eq!("   ".split_ascii_whitespace().next(), None);
+    /// ```
     #[must_use = "this returns the split string as an iterator, \
                   without modifying the original"]
     #[stable(feature = "split_ascii_whitespace", since = "1.34.0")]
@@ -958,8 +963,10 @@ impl str {
 
     /// An iterator over the lines of a string, as string slices.
     ///
-    /// Lines are ended with either a newline (`\n`) or a carriage return with
-    /// a line feed (`\r\n`).
+    /// Lines are split at line endings that are either newlines (`\n`) or
+    /// sequences of a carriage return followed by a line feed (`\r\n`).
+    ///
+    /// Line terminators are not included in the lines returned by the iterator.
     ///
     /// The final line ending is optional. A string that ends with a final line
     /// ending will return the same lines as an otherwise identical string
@@ -997,7 +1004,7 @@ impl str {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn lines(&self) -> Lines<'_> {
-        Lines(self.split_terminator('\n').map(LinesAnyMap))
+        Lines(self.split_inclusive('\n').map(LinesMap))
     }
 
     /// An iterator over the lines of a string.
@@ -2351,13 +2358,24 @@ impl str {
     /// assert!(!non_ascii.is_ascii());
     /// ```
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
+    #[rustc_const_unstable(feature = "const_slice_is_ascii", issue = "111090")]
     #[must_use]
     #[inline]
-    pub fn is_ascii(&self) -> bool {
+    pub const fn is_ascii(&self) -> bool {
         // We can treat each byte as character here: all multibyte characters
         // start with a byte that is not in the ASCII range, so we will stop
         // there already.
         self.as_bytes().is_ascii()
+    }
+
+    /// If this string slice [`is_ascii`](Self::is_ascii), returns it as a slice
+    /// of [ASCII characters](`ascii::Char`), otherwise returns `None`.
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[must_use]
+    #[inline]
+    pub const fn as_ascii(&self) -> Option<&[ascii::Char]> {
+        // Like in `is_ascii`, we can work on the bytes directly.
+        self.as_bytes().as_ascii()
     }
 
     /// Checks that two strings are an ASCII case-insensitive match.
@@ -2568,8 +2586,7 @@ impl AsRef<[u8]> for str {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
-impl const Default for &str {
+impl Default for &str {
     /// Creates an empty str
     #[inline]
     fn default() -> Self {
@@ -2590,10 +2607,10 @@ impl Default for &mut str {
 impl_fn_for_zst! {
     /// A nameable, cloneable fn type
     #[derive(Clone)]
-    struct LinesAnyMap impl<'a> Fn = |line: &'a str| -> &'a str {
-        let l = line.len();
-        if l > 0 && line.as_bytes()[l - 1] == b'\r' { &line[0 .. l - 1] }
-        else { line }
+    struct LinesMap impl<'a> Fn = |line: &'a str| -> &'a str {
+        let Some(line) = line.strip_suffix('\n') else { return line };
+        let Some(line) = line.strip_suffix('\r') else { return line };
+        line
     };
 
     #[derive(Clone)]
@@ -2641,5 +2658,6 @@ impl_fn_for_zst! {
     };
 }
 
+// This is required to make `impl From<&str> for Box<dyn Error>` and `impl<E> From<E> for Box<dyn Error>` not overlap.
 #[stable(feature = "rust1", since = "1.0.0")]
 impl !crate::error::Error for &str {}
